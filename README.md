@@ -8,14 +8,20 @@
 |---|---|
 | `greet(name)` | 이름을 받아 인사말을 돌려준다 |
 | `add(a, b)` | 두 수를 더한다 |
+| `save_conversation(...)` | 대화를 DB에 저장 (같은 `conversation_key`면 갱신/업서트) |
+| `get_conversation(key)` | 저장된 대화 하나를 메시지 전체와 함께 로드 |
+| `list_conversations(limit)` | 저장된 대화 목록 (최근 갱신순, 본문 제외) |
+| `search_conversations(query, limit)` | 제목+본문 키워드 검색 |
+
+대화 저장 툴은 Postgres가 필요하며 `DATABASE_URL` 환경변수로 접속 문자열을 받는다 (Neon 등). `greet`/`add`는 DB 없이 동작한다.
 
 ## 로컬 실행
 
 [uv](https://docs.astral.sh/uv/)가 필요하다.
 
 ```bash
-uv sync                    # 의존성 설치
-uv run python server.py    # 기본 8000 포트에서 실행
+uv sync                                       # 의존성 설치
+DATABASE_URL="postgresql://..." uv run python server.py    # 기본 8000 포트에서 실행
 ```
 
 포트를 바꾸려면:

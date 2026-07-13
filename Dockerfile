@@ -6,7 +6,7 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --locked --no-cache
 
-COPY server.py client.py ./
+COPY server.py client.py db.py ./
 
 EXPOSE 8000
 
