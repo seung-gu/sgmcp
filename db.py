@@ -6,18 +6,31 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
-_SCHEMA = """
-CREATE TABLE IF NOT EXISTS conversations (
-    id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
-    conversation_key TEXT UNIQUE NOT NULL,
-    title TEXT NOT NULL,
-    source TEXT NOT NULL DEFAULT '',
-    tags TEXT[] NOT NULL DEFAULT '{}',
-    messages JSONB NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-)
-"""
+_SCHEMA = [
+    """
+    CREATE TABLE IF NOT EXISTS conversations (
+        id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        conversation_key TEXT UNIQUE NOT NULL,
+        title TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT '',
+        tags TEXT[] NOT NULL DEFAULT '{}',
+        messages JSONB NOT NULL,
+        created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    )
+    """,
+    "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS project TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS summary TEXT NOT NULL DEFAULT ''",
+    "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS embedding REAL[]",
+    "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS embedded_at TIMESTAMPTZ",
+    "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS cluster_small INT",
+    "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS cluster_small_label TEXT",
+    "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS cluster_big INT",
+    "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS cluster_big_label TEXT",
+    "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS px REAL",
+    "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS py REAL",
+    "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS pz REAL",
+]
 
 _schema_ready = False
 
@@ -26,7 +39,8 @@ def _connect() -> psycopg.Connection:
     global _schema_ready
     conn = psycopg.connect(os.environ["DATABASE_URL"], row_factory=dict_row)
     if not _schema_ready:
-        conn.execute(_SCHEMA)
+        for statement in _SCHEMA:
+            conn.execute(statement)
         conn.commit()
         _schema_ready = True
     return conn
@@ -34,28 +48,38 @@ def _connect() -> psycopg.Connection:
 
 def _isoformat(row: dict) -> dict:
     for field in ("created_at", "updated_at"):
-        if field in row:
+        if field in row and row[field] is not None:
             row[field] = row[field].isoformat()
     return row
 
 
 def save_conversation(
-    key: str, title: str, messages: list[dict], source: str, tags: list[str]
+    key: str,
+    title: str,
+    messages: list[dict],
+    source: str,
+    tags: list[str],
+    project: str = "",
+    summary: str = "",
 ) -> dict:
     with _connect() as conn:
         row = conn.execute(
             """
-            INSERT INTO conversations (conversation_key, title, messages, source, tags)
-            VALUES (%s, %s, %s, %s, %s)
+            INSERT INTO conversations (conversation_key, title, messages, source, tags, project, summary)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (conversation_key) DO UPDATE
                 SET title = EXCLUDED.title,
                     messages = EXCLUDED.messages,
                     source = EXCLUDED.source,
                     tags = EXCLUDED.tags,
+                    project = CASE WHEN EXCLUDED.project <> '' THEN EXCLUDED.project
+                                   ELSE conversations.project END,
+                    summary = CASE WHEN EXCLUDED.summary <> '' THEN EXCLUDED.summary
+                                   ELSE conversations.summary END,
                     updated_at = now()
             RETURNING id, (created_at = updated_at) AS is_new
             """,
-            (key, title, Jsonb(messages), source, tags),
+            (key, title, Jsonb(messages), source, tags, project, summary),
         ).fetchone()
     return {
         "conversation_key": key,
@@ -64,7 +88,9 @@ def save_conversation(
     }
 
 
-def append_messages(key: str, new_messages: list[dict]) -> dict | None:
+def append_messages(
+    key: str, new_messages: list[dict], summary: str = "", project: str = ""
+) -> dict | None:
     with _connect() as conn:
         row = conn.execute(
             "SELECT messages FROM conversations WHERE conversation_key = %s FOR UPDATE",
@@ -85,11 +111,14 @@ def append_messages(key: str, new_messages: list[dict]) -> dict | None:
         updated = conn.execute(
             """
             UPDATE conversations
-            SET messages = messages || %s, updated_at = now()
+            SET messages = messages || %s,
+                summary = CASE WHEN %s <> '' THEN %s ELSE summary END,
+                project = CASE WHEN %s <> '' THEN %s ELSE project END,
+                updated_at = now()
             WHERE conversation_key = %s
             RETURNING jsonb_array_length(messages) AS total
             """,
-            (Jsonb(new_messages), key),
+            (Jsonb(new_messages), summary, summary, project, project, key),
         ).fetchone()
     return {
         "conversation_key": key,
@@ -102,7 +131,8 @@ def get_conversation(key: str) -> dict | None:
     with _connect() as conn:
         row = conn.execute(
             """
-            SELECT conversation_key, title, source, tags, messages, created_at, updated_at
+            SELECT conversation_key, title, source, tags, project, summary,
+                   messages, created_at, updated_at
             FROM conversations
             WHERE conversation_key = %s
             """,
@@ -111,13 +141,18 @@ def get_conversation(key: str) -> dict | None:
     return _isoformat(row) if row else None
 
 
+_LIST_COLUMNS = """
+    conversation_key, title, source, tags, project, summary,
+    jsonb_array_length(messages) AS message_count,
+    created_at, updated_at
+"""
+
+
 def list_conversations(limit: int) -> list[dict]:
     with _connect() as conn:
         rows = conn.execute(
-            """
-            SELECT conversation_key, title, source, tags,
-                   jsonb_array_length(messages) AS message_count,
-                   created_at, updated_at
+            f"""
+            SELECT {_LIST_COLUMNS}
             FROM conversations
             ORDER BY updated_at DESC
             LIMIT %s
@@ -131,15 +166,82 @@ def search_conversations(query: str, limit: int) -> list[dict]:
     pattern = f"%{query}%"
     with _connect() as conn:
         rows = conn.execute(
-            """
-            SELECT conversation_key, title, source, tags,
-                   jsonb_array_length(messages) AS message_count,
-                   created_at, updated_at
+            f"""
+            SELECT {_LIST_COLUMNS}
             FROM conversations
-            WHERE title ILIKE %s OR messages::text ILIKE %s
+            WHERE title ILIKE %s OR summary ILIKE %s OR messages::text ILIKE %s
             ORDER BY updated_at DESC
             LIMIT %s
             """,
-            (pattern, pattern, limit),
+            (pattern, pattern, pattern, limit),
+        ).fetchall()
+    return [_isoformat(row) for row in rows]
+
+
+# --- 이하 대시보드/그룹화 파이프라인용 ---
+
+
+def rows_needing_embedding() -> list[dict]:
+    with _connect() as conn:
+        return conn.execute(
+            """
+            SELECT id, conversation_key, title, tags, summary,
+                   concat_ws(' ', messages->0->>'content', messages->1->>'content') AS snippet
+            FROM conversations
+            WHERE embedding IS NULL OR embedded_at < updated_at
+            ORDER BY id
+            """
+        ).fetchall()
+
+
+def set_embeddings(pairs: list[tuple[int, list[float]]]) -> None:
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.executemany(
+                "UPDATE conversations SET embedding = %s::real[], embedded_at = now() WHERE id = %s",
+                [(vec, row_id) for row_id, vec in pairs],
+            )
+
+
+def all_embedded() -> list[dict]:
+    with _connect() as conn:
+        return conn.execute(
+            """
+            SELECT id, conversation_key, title, tags, embedding
+            FROM conversations
+            WHERE embedding IS NOT NULL
+            ORDER BY id
+            """
+        ).fetchall()
+
+
+def apply_grouping(rows: list[dict]) -> None:
+    """rows: [{id, cluster_small, cluster_small_label, cluster_big, cluster_big_label, px, py, pz}]"""
+    with _connect() as conn:
+        with conn.cursor() as cur:
+            cur.executemany(
+                """
+                UPDATE conversations
+                SET cluster_small = %(cluster_small)s,
+                    cluster_small_label = %(cluster_small_label)s,
+                    cluster_big = %(cluster_big)s,
+                    cluster_big_label = %(cluster_big_label)s,
+                    px = %(px)s, py = %(py)s, pz = %(pz)s
+                WHERE id = %(id)s
+                """,
+                rows,
+            )
+
+
+def projection_rows() -> list[dict]:
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT conversation_key, title, project, tags, updated_at,
+                   cluster_small, cluster_small_label, cluster_big, cluster_big_label,
+                   px, py, pz
+            FROM conversations
+            ORDER BY updated_at DESC
+            """
         ).fetchall()
     return [_isoformat(row) for row in rows]

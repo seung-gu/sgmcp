@@ -8,13 +8,29 @@
 |---|---|
 | `greet(name)` | 이름을 받아 인사말을 돌려준다 |
 | `add(a, b)` | 두 수를 더한다 |
-| `save_conversation(...)` | 대화 최초 생성 (또는 전체 덮어쓰기 수리용) |
-| `append_messages(key, new_messages)` | 직전 턴 메시지만 덧붙임 — 매 턴 저장용, 중복 자동 방어 |
-| `get_conversation(key)` | 저장된 대화 하나를 메시지 전체와 함께 로드 |
+| `save_conversation(...)` | 대화 최초 생성 (또는 전체 덮어쓰기 수리용). project/summary 메타 포함 |
+| `append_messages(key, new_messages, summary?, project?)` | 직전 턴 메시지만 덧붙임 — 매 턴 저장용, 중복 자동 방어. summary/project는 값이 있을 때만 갱신 |
+| `get_conversation(key, full=False)` | 저장된 대화 로드. 기본은 요약 중심, `full=true`면 메시지 원문 포함 |
 | `list_conversations(limit)` | 저장된 대화 목록 (최근 갱신순, 본문 제외) |
-| `search_conversations(query, limit)` | 제목+본문 키워드 검색 |
+| `search_conversations(query, limit)` | 제목+요약+본문 키워드 검색 |
 
-대화 저장 툴은 Postgres가 필요하며 `DATABASE_URL` 환경변수로 접속 문자열을 받는다 (Neon 등). `greet`/`add`는 DB 없이 동작한다.
+## 대시보드
+
+같은 서버가 웹 대시보드를 서빙한다: `https://<호스트>/?token=<DASHBOARD_TOKEN>`
+
+- 대화 목록·검색·열람 (메시지 채팅 뷰)
+- 그룹 트리 (대분류 → 소분류) 와 임베딩 3D 프로젝션 (PCA)
+- "그룹 새로고침" 버튼: 오래된 임베딩 갱신 → 재클러스터링 → 좌표 재계산 (`OPENAI_API_KEY` 필요)
+
+## 환경변수
+
+| 변수 | 용도 |
+|---|---|
+| `DATABASE_URL` | Postgres 접속 문자열 (Neon 등). 대화 저장 툴·대시보드에 필요 |
+| `DASHBOARD_TOKEN` | 대시보드 접근 토큰. 미설정 시 대시보드 비활성 |
+| `OPENAI_API_KEY` | 임베딩 생성용 (text-embedding-3-small). 없어도 목록/검색은 동작 |
+
+`greet`/`add`는 아무 환경변수 없이 동작한다.
 
 ## 로컬 실행
 

@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>sgmcp — 대화 아카이브</title>
+<script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
+<style>
+  * { box-sizing: border-box; margin: 0; }
+  body { font-family: -apple-system, "Apple SD Gothic Neo", sans-serif; background: #14161a; color: #e6e8eb; }
+  header { display: flex; gap: 12px; align-items: center; padding: 14px 20px; border-bottom: 1px solid #2a2e35; }
+  header h1 { font-size: 16px; margin-right: auto; }
+  input[type=search] { background: #1e2127; border: 1px solid #33383f; color: #e6e8eb; border-radius: 8px; padding: 8px 12px; width: 280px; }
+  button { background: #2b6cf0; border: 0; color: #fff; border-radius: 8px; padding: 8px 14px; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: wait; }
+  #status { color: #8b93a1; font-size: 13px; }
+  .layout { display: grid; grid-template-columns: 280px 1fr; min-height: calc(100vh - 61px); }
+  aside { border-right: 1px solid #2a2e35; padding: 16px; overflow-y: auto; }
+  aside h2, section h2 { font-size: 13px; color: #8b93a1; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 10px; }
+  details { margin-bottom: 6px; }
+  summary { cursor: pointer; padding: 4px 0; color: #c9cdd3; }
+  details details { margin-left: 14px; }
+  .tree-item { display: block; margin-left: 26px; padding: 3px 0; color: #9aa3b0; cursor: pointer; font-size: 13px; }
+  .tree-item:hover { color: #fff; }
+  main { padding: 16px 20px; overflow-y: auto; }
+  section { margin-bottom: 28px; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th { text-align: left; color: #8b93a1; font-weight: 500; padding: 8px; border-bottom: 1px solid #2a2e35; }
+  td { padding: 10px 8px; border-bottom: 1px solid #22262c; vertical-align: top; }
+  tr:hover td { background: #1b1e24; cursor: pointer; }
+  .title { color: #fff; font-weight: 600; }
+  .summary { color: #9aa3b0; font-size: 13px; margin-top: 3px; max-width: 640px; }
+  .badge { display: inline-block; background: #262b33; color: #a9b2c0; border-radius: 20px; padding: 2px 9px; font-size: 12px; margin: 1px 3px 1px 0; }
+  .badge.src { background: #24344d; color: #8db4f5; }
+  #plot { height: 520px; background: #1a1d22; border-radius: 12px; }
+  .muted { color: #6d7580; font-size: 13px; padding: 20px 0; }
+  #modal { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: none; align-items: flex-start; justify-content: center; padding: 40px 16px; overflow-y: auto; }
+  #modal.open { display: flex; }
+  .card { background: #1b1e24; border: 1px solid #2e333b; border-radius: 14px; max-width: 780px; width: 100%; padding: 24px; }
+  .card h3 { margin-bottom: 6px; }
+  .meta { color: #8b93a1; font-size: 13px; margin-bottom: 14px; }
+  .msg { margin: 10px 0; padding: 10px 14px; border-radius: 10px; white-space: pre-wrap; word-break: break-word; font-size: 14px; line-height: 1.55; }
+  .msg.user { background: #24344d; }
+  .msg.assistant { background: #22262c; }
+  .msg .role { font-size: 11px; color: #8b93a1; display: block; margin-bottom: 4px; text-transform: uppercase; }
+  .close { float: right; background: #33383f; }
+</style>
+</head>
+<body>
+<header>
+  <h1>sgmcp 대화 아카이브</h1>
+  <span id="status"></span>
+  <input type="search" id="q" placeholder="검색 (제목·요약·본문)">
+  <button id="refreshBtn" onclick="refreshGroups()">그룹 새로고침</button>
+</header>
+
+<div class="layout">
+  <aside>
+    <h2>그룹</h2>
+    <div id="tree" class="muted">그룹 없음 — "그룹 새로고침"을 눌러 생성</div>
+  </aside>
+  <main>
+    <section>
+      <h2>임베딩 프로젝션 (3D)</h2>
+      <div id="plot"></div>
+    </section>
+    <section>
+      <h2>대화 목록 <span id="count" style="text-transform:none"></span></h2>
+      <table>
+        <thead><tr><th>대화</th><th>소분류</th><th>출처 / 프로젝트 / 태그</th><th>메시지</th><th>갱신</th></tr></thead>
+        <tbody id="rows"></tbody>
+      </table>
+    </section>
+  </main>
+</div>
+
+<div id="modal" onclick="if(event.target===this)closeModal()">
+  <div class="card">
+    <button class="close" onclick="closeModal()">닫기</button>
+    <h3 id="mTitle"></h3>
+    <div class="meta" id="mMeta"></div>
+    <div class="summary" id="mSummary" style="margin-bottom:14px"></div>
+    <div id="mMessages"></div>
+  </div>
+</div>
+
+<script>
+const token = new URLSearchParams(location.search).get('token') || '';
+let projByKey = {};
+
+const esc = s => (s ?? '').toString().replace(/[&<>"']/g,
+  c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+async function api(path, opts) {
+  const sep = path.includes('?') ? '&' : '?';
+  const res = await fetch(path + sep + 'token=' + encodeURIComponent(token), opts);
+  const body = await res.json();
+  if (!res.ok) throw new Error(body.error || res.status);
+  return body;
+}
+
+const fmtDate = iso => iso ? iso.slice(0, 16).replace('T', ' ') : '';
+
+function renderTable(rows) {
+  document.getElementById('count').textContent = `(${rows.length})`;
+  document.getElementById('rows').innerHTML = rows.map(r => `
+    <tr onclick="openDetail('${esc(r.conversation_key)}')">
+      <td><div class="title">${esc(r.title)}</div>
+          <div class="summary">${esc(r.summary)}</div></td>
+      <td>${esc(projByKey[r.conversation_key]?.cluster_small_label ?? '—')}</td>
+      <td>${r.source ? `<span class="badge src">${esc(r.source)}</span>` : ''}
+          ${r.project ? `<span class="badge">📁 ${esc(r.project)}</span>` : ''}
+          ${(r.tags || []).map(t => `<span class="badge">${esc(t)}</span>`).join('')}</td>
+      <td>${r.message_count}</td>
+      <td>${fmtDate(r.updated_at)}</td>
+    </tr>`).join('') || '<tr><td colspan="5" class="muted">저장된 대화가 없습니다</td></tr>';
+}
+
+function renderTree(proj) {
+  const grouped = proj.filter(p => p.cluster_big_label != null);
+  if (!grouped.length) return;
+  const bigs = {};
+  for (const p of grouped) {
+    const b = (bigs[p.cluster_big_label] ??= {});
+    (b[p.cluster_small_label] ??= []).push(p);
+  }
+  document.getElementById('tree').innerHTML = Object.entries(bigs).map(([big, smalls]) => `
+    <details open><summary>${esc(big)}</summary>
+      ${Object.entries(smalls).map(([small, items]) => `
+        <details><summary>${esc(small)} (${items.length})</summary>
+          ${items.map(i => `<span class="tree-item" onclick="openDetail('${esc(i.conversation_key)}')">${esc(i.title)}</span>`).join('')}
+        </details>`).join('')}
+    </details>`).join('');
+}
+
+function renderPlot(proj) {
+  const pts = proj.filter(p => p.px != null);
+  const el = document.getElementById('plot');
+  if (!pts.length) {
+    el.innerHTML = '<div class="muted" style="padding:30px">좌표 없음 — OPENAI_API_KEY 설정 후 "그룹 새로고침"을 누르면 생성됩니다</div>';
+    return;
+  }
+  const byCluster = {};
+  for (const p of pts) (byCluster[p.cluster_small_label ?? '미분류'] ??= []).push(p);
+  const traces = Object.entries(byCluster).map(([label, items]) => ({
+    name: label, type: 'scatter3d', mode: 'markers',
+    x: items.map(i => i.px), y: items.map(i => i.py), z: items.map(i => i.pz),
+    text: items.map(i => i.title), customdata: items.map(i => i.conversation_key),
+    hovertemplate: '%{text}<extra>' + label + '</extra>',
+    marker: { size: 5, opacity: .85 },
+  }));
+  Plotly.newPlot(el, traces, {
+    paper_bgcolor: '#1a1d22', font: { color: '#c9cdd3' },
+    margin: { l: 0, r: 0, t: 10, b: 0 },
+    scene: { xaxis: {title:''}, yaxis: {title:''}, zaxis: {title:''} },
+    legend: { orientation: 'h' },
+  }, { displayModeBar: false });
+  el.on('plotly_click', d => openDetail(d.points[0].customdata));
+}
+
+async function openDetail(key) {
+  const c = await api('/api/conversation/' + encodeURIComponent(key));
+  document.getElementById('mTitle').textContent = c.title;
+  document.getElementById('mMeta').textContent =
+    [c.source, c.project && '📁 ' + c.project, (c.tags || []).join(', '), fmtDate(c.updated_at)]
+      .filter(Boolean).join(' · ');
+  document.getElementById('mSummary').textContent = c.summary || '';
+  document.getElementById('mMessages').innerHTML = (c.messages || []).map(m => `
+    <div class="msg ${esc(m.role)}"><span class="role">${esc(m.role)}</span>${esc(m.content)}</div>`).join('');
+  document.getElementById('modal').classList.add('open');
+}
+const closeModal = () => document.getElementById('modal').classList.remove('open');
+
+let searchTimer;
+document.getElementById('q').addEventListener('input', e => {
+  clearTimeout(searchTimer);
+  searchTimer = setTimeout(async () => {
+    const q = e.target.value.trim();
+    renderTable(q ? await api('/api/search?q=' + encodeURIComponent(q)) : allRows);
+  }, 250);
+});
+
+async function refreshGroups() {
+  const btn = document.getElementById('refreshBtn'), st = document.getElementById('status');
+  btn.disabled = true; st.textContent = '재계산 중…';
+  try {
+    const r = await api('/api/refresh', { method: 'POST' });
+    st.textContent = `임베딩 ${r.embedded}건 갱신 · 대분류 ${r.clusters_big} · 소분류 ${r.clusters_small}`;
+    await load();
+  } catch (err) { st.textContent = '⚠ ' + err.message; }
+  btn.disabled = false;
+}
+
+let allRows = [];
+async function load() {
+  const [rows, proj] = await Promise.all([api('/api/conversations'), api('/api/projection')]);
+  allRows = rows;
+  projByKey = Object.fromEntries(proj.map(p => [p.conversation_key, p]));
+  renderTable(rows); renderTree(proj); renderPlot(proj);
+}
+load().catch(e => document.getElementById('status').textContent = '⚠ ' + e.message);
+</script>
+</body>
+</html>
