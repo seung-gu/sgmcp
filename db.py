@@ -64,6 +64,40 @@ def save_conversation(
     }
 
 
+def append_messages(key: str, new_messages: list[dict]) -> dict | None:
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT messages FROM conversations WHERE conversation_key = %s FOR UPDATE",
+            (key,),
+        ).fetchone()
+        if row is None:
+            return None
+        current = row["messages"]
+        n = len(new_messages)
+        # 중복 방어: 직전에 붙인 것과 동일한 턴이면 쓰지 않는다 (재시도 대비)
+        if n == 0 or current[-n:] == new_messages:
+            return {
+                "conversation_key": key,
+                "appended": 0,
+                "total_messages": len(current),
+                "note": "이미 저장된 턴이라 건너뜀",
+            }
+        updated = conn.execute(
+            """
+            UPDATE conversations
+            SET messages = messages || %s, updated_at = now()
+            WHERE conversation_key = %s
+            RETURNING jsonb_array_length(messages) AS total
+            """,
+            (Jsonb(new_messages), key),
+        ).fetchone()
+    return {
+        "conversation_key": key,
+        "appended": n,
+        "total_messages": updated["total"],
+    }
+
+
 def get_conversation(key: str) -> dict | None:
     with _connect() as conn:
         row = conn.execute(

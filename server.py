@@ -55,10 +55,35 @@ def save_conversation(
     ] = "",
     tags: Annotated[list[str], Field(description="나중에 찾기 쉽게 붙이는 태그 목록")] = [],
 ) -> dict:
-    """대화를 DB에 저장합니다. 같은 conversation_key로 다시 저장하면 덮어씁니다(업서트)."""
+    """대화 시작 시 최초 1회 생성용 (또는 기록이 꼬였을 때 전체를 덮어쓰는 수리용).
+    이후 턴을 추가할 때는 append_messages를 사용하세요."""
     return db.save_conversation(
         conversation_key, title, [m.model_dump() for m in messages], source, tags
     )
+
+
+@mcp.tool()
+def append_messages(
+    conversation_key: Annotated[
+        str,
+        Field(description="덧붙일 대상 대화의 식별 키 (save_conversation으로 먼저 생성돼 있어야 함)"),
+    ],
+    new_messages: Annotated[
+        list[Message],
+        Field(
+            description="직전 턴의 새 메시지들만. 이미 저장된 메시지는 다시 보내지 말 것",
+            min_length=1,
+        ),
+    ],
+) -> dict:
+    """직전 턴의 메시지만 기존 대화 뒤에 덧붙입니다. 매 턴 저장은 이 툴을 쓰세요.
+    같은 내용을 연속으로 두 번 보내면 자동으로 무시됩니다(중복 방어)."""
+    result = db.append_messages(conversation_key, [m.model_dump() for m in new_messages])
+    if result is None:
+        raise ValueError(
+            f"'{conversation_key}' 대화가 없습니다. save_conversation으로 먼저 대화를 생성하세요."
+        )
+    return result
 
 
 @mcp.tool()
