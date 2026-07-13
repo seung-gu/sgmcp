@@ -23,6 +23,8 @@ _SCHEMA = [
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS summary TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS embedding REAL[]",
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS embedded_at TIMESTAMPTZ",
+    "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS embedded_message_count INT NOT NULL DEFAULT 0",
+    "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS embedded_vector_count INT NOT NULL DEFAULT 0",
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS cluster_small INT",
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS cluster_small_label TEXT",
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS cluster_big INT",
@@ -182,25 +184,33 @@ def search_conversations(query: str, limit: int) -> list[dict]:
 
 
 def rows_needing_embedding() -> list[dict]:
+    """아직 임베딩에 반영되지 않은 메시지가 있는 대화들."""
     with _connect() as conn:
         return conn.execute(
             """
-            SELECT id, conversation_key, title, tags, summary,
-                   concat_ws(' ', messages->0->>'content', messages->1->>'content') AS snippet
+            SELECT id, messages, embedding, embedded_message_count, embedded_vector_count
             FROM conversations
-            WHERE embedding IS NULL OR embedded_at < updated_at
+            WHERE embedded_message_count < jsonb_array_length(messages)
             ORDER BY id
             """
         ).fetchall()
 
 
-def set_embeddings(pairs: list[tuple[int, list[float]]]) -> None:
+def set_embedding_state(
+    row_id: int, mean: list[float] | None, message_count: int, vector_count: int
+) -> None:
     with _connect() as conn:
-        with conn.cursor() as cur:
-            cur.executemany(
-                "UPDATE conversations SET embedding = %s::real[], embedded_at = now() WHERE id = %s",
-                [(vec, row_id) for row_id, vec in pairs],
-            )
+        conn.execute(
+            """
+            UPDATE conversations
+            SET embedding = %s::real[],
+                embedded_message_count = %s,
+                embedded_vector_count = %s,
+                embedded_at = now()
+            WHERE id = %s
+            """,
+            (mean, message_count, vector_count, row_id),
+        )
 
 
 def all_embedded() -> list[dict]:

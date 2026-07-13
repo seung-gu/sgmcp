@@ -11,6 +11,7 @@ import db
 EMBED_MODEL = "text-embedding-3-small"
 T_SMALL = 0.62  # 소분류 병합 임계 (cosine)
 T_BIG = 0.45  # 대분류 병합 임계
+MIN_CHARS = 30  # 이보다 짧은 메시지("고마워" 등)는 대표 벡터 계산에서 제외
 
 
 def _embed_texts(texts: list[str]) -> list[list[float]]:
@@ -28,12 +29,25 @@ def _embed_texts(texts: list[str]) -> list[list[float]]:
     return vectors
 
 
-def _embed_input(row: dict) -> str:
-    parts = [row["title"]]
-    if row["tags"]:
-        parts.append("태그: " + ", ".join(row["tags"]))
-    parts.append(row["summary"] or row["snippet"] or "")
-    return "\n".join(p for p in parts if p)[:6000]
+def _update_conversation_vector(row: dict, vectors: np.ndarray | None, new_count: int) -> int:
+    """새 메시지 벡터들을 기존 이동 평균에 증분 병합. 임베딩된 벡터 수를 반환."""
+    old_count = row["embedded_vector_count"]
+    total_messages = len(row["messages"])
+    if vectors is None or len(vectors) == 0:
+        # 새 메시지가 전부 필터에 걸림 — 카운터만 최신화
+        db.set_embedding_state(row["id"], row["embedding"], total_messages, old_count)
+        return 0
+    new_sum = vectors.sum(axis=0)
+    if row["embedding"] is not None and old_count > 0:
+        mean = (np.array(row["embedding"], dtype=np.float32) * old_count + new_sum) / (
+            old_count + len(vectors)
+        )
+    else:
+        mean = new_sum / len(vectors)
+    db.set_embedding_state(
+        row["id"], [float(x) for x in mean], total_messages, old_count + len(vectors)
+    )
+    return len(vectors)
 
 
 def _agglomerate(vectors: np.ndarray, threshold: float) -> list[list[int]]:
@@ -76,14 +90,35 @@ def refresh() -> dict:
     if not os.environ.get("OPENAI_API_KEY"):
         raise RuntimeError("OPENAI_API_KEY가 설정되지 않았습니다 (목록/검색은 키 없이 동작합니다)")
 
+    # 대화별로 "아직 반영 안 된 새 메시지"만 골라 한 번에 임베딩 후 증분 평균에 병합
     stale = db.rows_needing_embedding()
-    if stale:
-        vectors = _embed_texts([_embed_input(row) for row in stale])
-        db.set_embeddings([(row["id"], vec) for row, vec in zip(stale, vectors)])
+    batches: list[tuple[dict, list[str]]] = []
+    for row in stale:
+        new_messages = row["messages"][row["embedded_message_count"] :]
+        texts = [
+            m["content"][:6000]
+            for m in new_messages
+            if len(m.get("content", "").strip()) >= MIN_CHARS
+        ]
+        batches.append((row, texts))
+
+    all_texts = [t for _, texts in batches for t in texts]
+    all_vectors = _embed_texts(all_texts) if all_texts else []
+
+    embedded_count = 0
+    position = 0
+    for row, texts in batches:
+        vectors = (
+            np.array(all_vectors[position : position + len(texts)], dtype=np.float32)
+            if texts
+            else None
+        )
+        position += len(texts)
+        embedded_count += _update_conversation_vector(row, vectors, len(texts))
 
     rows = db.all_embedded()
     if not rows:
-        return {"embedded": 0, "total": 0, "clusters_small": 0, "clusters_big": 0}
+        return {"embedded": embedded_count, "total": 0, "clusters_small": 0, "clusters_big": 0}
 
     matrix = np.array([row["embedding"] for row in rows], dtype=np.float32)
     matrix /= np.linalg.norm(matrix, axis=1, keepdims=True) + 1e-9
@@ -116,7 +151,7 @@ def refresh() -> dict:
     db.apply_grouping(updates)
 
     return {
-        "embedded": len(stale),
+        "embedded": embedded_count,
         "total": len(rows),
         "clusters_small": len(small_clusters),
         "clusters_big": len(big_of_small),
