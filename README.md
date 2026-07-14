@@ -29,6 +29,14 @@
 | `DATABASE_URL` | Postgres 접속 문자열 (Neon 등). 대화 저장 툴·대시보드에 필요 |
 | `DASHBOARD_TOKEN` | 대시보드 접근 토큰. 미설정 시 대시보드 비활성 |
 | `OPENAI_API_KEY` | 임베딩 생성용 (text-embedding-3-small). 없어도 목록/검색은 동작 |
+| `INGEST_TOKEN` | `POST /api/ingest` 인증 토큰 (Claude Code hook이 사용) |
+
+## Claude Code 자동 적재 (hook)
+
+`hooks/save_conversation.py`가 Claude Code의 Stop hook으로 등록되면 매 턴 종료 시
+세션 transcript(로컬 JSONL)에서 대화 텍스트만 추출해 `/api/ingest`로 업서트한다.
+토큰 비용 0, 원문 100%. 로컬 `.env`에 `INGEST_TOKEN`이 있어야 하며,
+`--backfill` 플래그로 과거 세션 전체를 일괄 적재할 수 있다.
 
 `greet`/`add`는 아무 환경변수 없이 동작한다.
 

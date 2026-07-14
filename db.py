@@ -217,7 +217,8 @@ def all_embedded() -> list[dict]:
     with _connect() as conn:
         return conn.execute(
             """
-            SELECT id, conversation_key, title, tags, embedding
+            SELECT id, conversation_key, title, tags, embedding,
+                   left(messages->0->>'content', 200) AS sample
             FROM conversations
             WHERE embedding IS NOT NULL
             ORDER BY id

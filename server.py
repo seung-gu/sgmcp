@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 import client
 import dashboard
 import db
+import ingest
 
 mcp = FastMCP(
     "sgmcp",
@@ -143,6 +144,7 @@ def search_conversations(
 
 
 dashboard.register(mcp)
+ingest.register(mcp)
 
 
 if __name__ == "__main__":
