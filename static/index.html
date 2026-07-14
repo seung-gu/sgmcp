@@ -105,7 +105,7 @@ function renderTable(rows) {
   document.getElementById('count').textContent = `(${rows.length})`;
   document.getElementById('rows').innerHTML = rows.map(r => `
     <tr onclick="openDetail('${esc(r.conversation_key)}')">
-      <td><div class="title">${esc(r.title)}</div>
+      <td><div class="title">${esc(r.title || r.conversation_key)}</div>
           <div class="summary">${esc(r.summary)}</div></td>
       <td>${esc(projByKey[r.conversation_key]?.cluster_small_label ?? '—')}</td>
       <td>${r.source ? `<span class="badge src">${esc(r.source)}</span>` : ''}
@@ -160,7 +160,7 @@ function renderPlot(proj) {
 
 async function openDetail(key) {
   const c = await api('/api/conversation/' + encodeURIComponent(key));
-  document.getElementById('mTitle').textContent = c.title;
+  document.getElementById('mTitle').textContent = c.title || c.conversation_key;
   document.getElementById('mMeta').textContent =
     [c.source, c.project && '📁 ' + c.project, (c.tags || []).join(', '), fmtDate(c.updated_at)]
       .filter(Boolean).join(' · ');

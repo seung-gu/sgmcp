@@ -65,7 +65,6 @@ def _push(session_id: str, transcript_path: Path) -> str:
         return f"{session_id}: 대화 없음, 건너뜀"
     payload = {
         "conversation_key": f"cc-{session_id}",
-        "title": messages[0]["content"].splitlines()[0][:60],
         "messages": messages,
         "source": "claude-code",
         "project": Path(cwd).name if cwd else "",

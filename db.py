@@ -25,6 +25,7 @@ _SCHEMA = [
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS embedded_at TIMESTAMPTZ",
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS embedded_message_count INT NOT NULL DEFAULT 0",
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS embedded_vector_count INT NOT NULL DEFAULT 0",
+    "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS tagged_embedding REAL[]",
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS cluster_small INT",
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS cluster_small_label TEXT",
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS cluster_big INT",
@@ -57,31 +58,30 @@ def _isoformat(row: dict) -> dict:
 
 def save_conversation(
     key: str,
-    title: str,
     messages: list[dict],
     source: str,
-    tags: list[str],
     project: str = "",
-    summary: str = "",
 ) -> dict:
+    """대화 생성 또는 전체 덮어쓰기(수리). 제목·태그·요약은 서버 파생이 채운다.
+    덮어쓰기 시에는 내용이 통째로 바뀌므로 파생 산출물(임베딩·앵커)을 리셋해 재파생을 유도한다."""
     with _connect() as conn:
         row = conn.execute(
             """
-            INSERT INTO conversations (conversation_key, title, messages, source, tags, project, summary)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            INSERT INTO conversations (conversation_key, title, messages, source, project)
+            VALUES (%s, '', %s, %s, %s)
             ON CONFLICT (conversation_key) DO UPDATE
-                SET title = EXCLUDED.title,
-                    messages = EXCLUDED.messages,
+                SET messages = EXCLUDED.messages,
                     source = EXCLUDED.source,
-                    tags = EXCLUDED.tags,
                     project = CASE WHEN EXCLUDED.project <> '' THEN EXCLUDED.project
                                    ELSE conversations.project END,
-                    summary = CASE WHEN EXCLUDED.summary <> '' THEN EXCLUDED.summary
-                                   ELSE conversations.summary END,
+                    embedding = NULL,
+                    embedded_message_count = 0,
+                    embedded_vector_count = 0,
+                    tagged_embedding = NULL,
                     updated_at = now()
             RETURNING id, (created_at = updated_at) AS is_new
             """,
-            (key, title, Jsonb(messages), source, tags, project, summary),
+            (key, Jsonb(messages), source, project),
         ).fetchone()
     return {
         "conversation_key": key,
@@ -90,9 +90,7 @@ def save_conversation(
     }
 
 
-def append_messages(
-    key: str, new_messages: list[dict], summary: str = "", project: str = ""
-) -> dict | None:
+def append_messages(key: str, new_messages: list[dict], project: str = "") -> dict | None:
     with _connect() as conn:
         row = conn.execute(
             "SELECT messages FROM conversations WHERE conversation_key = %s FOR UPDATE",
@@ -114,13 +112,12 @@ def append_messages(
             """
             UPDATE conversations
             SET messages = messages || %s,
-                summary = CASE WHEN %s <> '' THEN %s ELSE summary END,
                 project = CASE WHEN %s <> '' THEN %s ELSE project END,
                 updated_at = now()
             WHERE conversation_key = %s
             RETURNING jsonb_array_length(messages) AS total
             """,
-            (Jsonb(new_messages), summary, summary, project, project, key),
+            (Jsonb(new_messages), project, project, key),
         ).fetchone()
     return {
         "conversation_key": key,
@@ -217,13 +214,83 @@ def all_embedded() -> list[dict]:
     with _connect() as conn:
         return conn.execute(
             """
-            SELECT id, conversation_key, title, tags, embedding,
+            SELECT id, conversation_key, title, tags, summary, embedding, tagged_embedding,
+                   cluster_small, cluster_small_label, cluster_big_label,
                    left(messages->0->>'content', 200) AS sample
             FROM conversations
             WHERE embedding IS NOT NULL
             ORDER BY id
             """
         ).fetchall()
+
+
+def set_metadata(
+    row_id: int, title: str, tags: list[str], summary: str, anchor: list[float]
+) -> None:
+    """파생 생성된 제목·태그·요약을 저장하고 앵커를 현재 벡터로 갱신한다."""
+    with _connect() as conn:
+        conn.execute(
+            """
+            UPDATE conversations
+            SET title = %s, tags = %s, summary = %s, tagged_embedding = %s::real[]
+            WHERE id = %s
+            """,
+            (title, tags, summary, anchor, row_id),
+        )
+
+
+def messages_excerpt(row_id: int, segments: int = 20) -> list[dict]:
+    """생성 입력용 표본: 대화를 구간으로 나눠 각 구간에서 역할별 최장 메시지를 1개씩 뽑는다.
+    user/assistant가 절반씩 들어가고, 대화 전체가 시간순으로 골고루 대표된다."""
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT messages FROM conversations WHERE id = %s", (row_id,)
+        ).fetchone()
+    messages = row["messages"]
+    if len(messages) <= segments * 2:
+        return messages
+    indexed = list(enumerate(messages))
+    size = len(messages) / segments
+    picked: dict[int, dict] = {}
+    for s in range(segments):
+        chunk = indexed[int(s * size) : int((s + 1) * size)]
+        for role in ("user", "assistant"):
+            candidates = [(i, m) for i, m in chunk if m.get("role") == role]
+            if candidates:
+                i, m = max(candidates, key=lambda im: len(im[1].get("content", "")))
+                picked[i] = m
+    return [picked[i] for i in sorted(picked)]
+
+
+def apply_tag_mapping(mapping: dict[str, str]) -> None:
+    """태그 병합표를 전체 대화에 적용한다 (예: 'MCP 연결' → 'MCP')."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT id, tags FROM conversations WHERE tags <> '{}'"
+        ).fetchall()
+        with conn.cursor() as cur:
+            for row in rows:
+                merged = []
+                for tag in row["tags"]:
+                    canon = mapping.get(tag, tag)
+                    if canon not in merged:
+                        merged.append(canon)
+                if merged != row["tags"]:
+                    cur.execute(
+                        "UPDATE conversations SET tags = %s WHERE id = %s",
+                        (merged, row["id"]),
+                    )
+
+
+def all_tags() -> list[str]:
+    """현재 아카이브에 존재하는 태그 어휘 (재사용 우선 생성용)."""
+    with _connect() as conn:
+        return [
+            r["tag"]
+            for r in conn.execute(
+                "SELECT DISTINCT unnest(tags) AS tag FROM conversations ORDER BY tag"
+            ).fetchall()
+        ]
 
 
 def apply_grouping(rows: list[dict]) -> None:

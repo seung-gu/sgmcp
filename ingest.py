@@ -28,12 +28,9 @@ def register(mcp) -> None:
             result = await run_in_threadpool(
                 db.save_conversation,
                 body["conversation_key"],
-                body["title"],
                 body["messages"],
                 body.get("source", ""),
-                body.get("tags", []),
                 body.get("project", ""),
-                body.get("summary", ""),
             )
         except KeyError as e:
             return JSONResponse({"error": f"필수 필드 누락: {e}"}, status_code=400)

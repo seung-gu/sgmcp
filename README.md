@@ -8,8 +8,8 @@
 |---|---|
 | `greet(name)` | 이름을 받아 인사말을 돌려준다 |
 | `add(a, b)` | 두 수를 더한다 |
-| `save_conversation(...)` | 대화 최초 생성 (또는 전체 덮어쓰기 수리용). project/summary 메타 포함 |
-| `append_messages(key, new_messages, summary?, project?)` | 직전 턴 메시지만 덧붙임 — 매 턴 저장용, 중복 자동 방어. summary/project는 값이 있을 때만 갱신 |
+| `save_conversation(messages, source?, project?, key?)` | 대화 최초 생성 (키 비우면 서버가 `cw-`+UUID 발급) 또는 전체 덮어쓰기 수리. 제목·태그·요약은 서버가 자동 생성 |
+| `append_messages(key, new_messages, project?)` | 직전 턴 메시지만 덧붙임 — 매 턴 저장용, 중복 자동 방어 |
 | `get_conversation(key, full=False)` | 저장된 대화 로드. 기본은 요약 중심, `full=true`면 메시지 원문 포함 |
 | `list_conversations(limit)` | 저장된 대화 목록 (최근 갱신순, 본문 제외) |
 | `search_conversations(query, limit)` | 제목+요약+본문 키워드 검색 |
@@ -20,7 +20,9 @@
 
 - 대화 목록·검색·열람 (메시지 채팅 뷰)
 - 그룹 트리 (대분류 → 소분류) 와 임베딩 3D 프로젝션 (PCA)
-- "그룹 새로고침" 버튼: 오래된 임베딩 갱신 → 재클러스터링 → 좌표 재계산 (`OPENAI_API_KEY` 필요)
+- "그룹 새로고침" 버튼: 새 메시지 임베딩 → 드리프트 판정. 걸린 대화가 없으면 여기서 끝(그룹·이름·좌표 유지),
+  있으면 제목·태그·요약 재생성 → 태그 병합 → 소분류 묶기(좌표) → 변경된 소분류만 LLM이 이름 짓고
+  대분류에 배정 → 좌표 재계산 (`OPENAI_API_KEY` 필요). 저장 경로(append/ingest)는 저장만 한다
 
 ## 환경변수
 
