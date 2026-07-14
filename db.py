@@ -1,4 +1,4 @@
-# 대화 저장/로드 로직 — Postgres (DATABASE_URL 환경변수 필요)
+# Conversation storage and derived-data queries — Postgres (requires DATABASE_URL)
 
 import os
 
@@ -23,9 +23,6 @@ _SCHEMA = [
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS summary TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS embedding REAL[]",
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS embedded_at TIMESTAMPTZ",
-    "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS embedded_message_count INT NOT NULL DEFAULT 0",
-    "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS embedded_vector_count INT NOT NULL DEFAULT 0",
-    "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS tagged_embedding REAL[]",
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS cluster_small INT",
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS cluster_small_label TEXT",
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS cluster_big INT",
@@ -33,7 +30,15 @@ _SCHEMA = [
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS px REAL",
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS py REAL",
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS pz REAL",
+    "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS embedded_message_count INT NOT NULL DEFAULT 0",
+    "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS embedded_vector_count INT NOT NULL DEFAULT 0",
+    "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS tagged_embedding REAL[]",
+    "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS source_url TEXT NOT NULL DEFAULT ''",
 ]
+
+# Ask the model to request the conversation URL when it's still missing and the
+# message count hits this (== 1 mod 40, i.e. round-trips 1, 21, 41, …).
+URL_PROMPT_EVERY = 40
 
 _schema_ready = False
 
@@ -61,76 +66,97 @@ def save_conversation(
     messages: list[dict],
     source: str,
     project: str = "",
+    source_url: str = "",
 ) -> dict:
-    """대화 생성 또는 전체 덮어쓰기(수리). 제목·태그·요약은 서버 파생이 채운다.
-    덮어쓰기 시에는 내용이 통째로 바뀌므로 파생 산출물(임베딩·앵커)을 리셋해 재파생을 유도한다."""
+    """Create a conversation, or overwrite it wholesale (repair). Title, tags and
+    summary are filled in by server-side derivation.
+
+    Derived artifacts (embedding, anchor) are reset only when the message count
+    shrinks — i.e. the content was genuinely rewritten. A re-backfill or a normal
+    growth keeps them, so incremental embedding picks up from where it left off
+    (an overwrite that keeps or grows the count doesn't waste a re-embed)."""
     with _connect() as conn:
         row = conn.execute(
             """
-            INSERT INTO conversations (conversation_key, title, messages, source, project)
-            VALUES (%s, '', %s, %s, %s)
+            INSERT INTO conversations (conversation_key, title, messages, source, project, source_url)
+            VALUES (%s, '', %s, %s, %s, %s)
             ON CONFLICT (conversation_key) DO UPDATE
                 SET messages = EXCLUDED.messages,
                     source = EXCLUDED.source,
                     project = CASE WHEN EXCLUDED.project <> '' THEN EXCLUDED.project
                                    ELSE conversations.project END,
-                    embedding = NULL,
-                    embedded_message_count = 0,
-                    embedded_vector_count = 0,
-                    tagged_embedding = NULL,
+                    source_url = CASE WHEN EXCLUDED.source_url <> '' THEN EXCLUDED.source_url
+                                      ELSE conversations.source_url END,
+                    embedding = CASE WHEN jsonb_array_length(EXCLUDED.messages)
+                                          < conversations.embedded_message_count
+                                     THEN NULL ELSE conversations.embedding END,
+                    embedded_message_count = CASE WHEN jsonb_array_length(EXCLUDED.messages)
+                                                       < conversations.embedded_message_count
+                                                  THEN 0 ELSE conversations.embedded_message_count END,
+                    embedded_vector_count = CASE WHEN jsonb_array_length(EXCLUDED.messages)
+                                                      < conversations.embedded_message_count
+                                                 THEN 0 ELSE conversations.embedded_vector_count END,
+                    tagged_embedding = CASE WHEN jsonb_array_length(EXCLUDED.messages)
+                                                 < conversations.embedded_message_count
+                                            THEN NULL ELSE conversations.tagged_embedding END,
                     updated_at = now()
             RETURNING id, (created_at = updated_at) AS is_new
             """,
-            (key, Jsonb(messages), source, project),
+            (key, Jsonb(messages), source, project, source_url),
         ).fetchone()
     return {
         "conversation_key": key,
         "message_count": len(messages),
-        "saved_as": "새 대화" if row["is_new"] else "기존 대화 갱신",
+        "saved_as": "created" if row["is_new"] else "overwritten",
     }
 
 
-def append_messages(key: str, new_messages: list[dict], project: str = "") -> dict | None:
+def append_messages(
+    key: str, new_messages: list[dict], project: str = "", source_url: str = ""
+) -> dict | None:
     with _connect() as conn:
         row = conn.execute(
-            "SELECT messages FROM conversations WHERE conversation_key = %s FOR UPDATE",
+            "SELECT messages, source_url FROM conversations WHERE conversation_key = %s FOR UPDATE",
             (key,),
         ).fetchone()
         if row is None:
             return None
         current = row["messages"]
         n = len(new_messages)
-        # 중복 방어: 직전에 붙인 것과 동일한 턴이면 쓰지 않는다 (재시도 대비)
+        # duplicate guard: ignore a turn identical to the current tail (retry safety)
         if n == 0 or current[-n:] == new_messages:
             return {
                 "conversation_key": key,
                 "appended": 0,
                 "total_messages": len(current),
-                "note": "이미 저장된 턴이라 건너뜀",
+                "note": "duplicate turn — skipped",
             }
         updated = conn.execute(
             """
             UPDATE conversations
             SET messages = messages || %s,
                 project = CASE WHEN %s <> '' THEN %s ELSE project END,
+                source_url = CASE WHEN %s <> '' THEN %s ELSE source_url END,
                 updated_at = now()
             WHERE conversation_key = %s
             RETURNING jsonb_array_length(messages) AS total
             """,
-            (Jsonb(new_messages), project, project, key),
+            (Jsonb(new_messages), project, project, source_url, source_url, key),
         ).fetchone()
-    return {
-        "conversation_key": key,
-        "appended": n,
-        "total_messages": updated["total"],
-    }
+    total = updated["total"]
+    has_url = bool(row["source_url"] or source_url)
+    result = {"conversation_key": key, "appended": n, "total_messages": total}
+    # periodically nudge the model to ask the user for this conversation's URL
+    if not has_url and total % URL_PROMPT_EVERY == 1:
+        result["ask_for_url"] = True
+    return result
 
 
 def get_conversation(key: str) -> dict | None:
     with _connect() as conn:
         row = conn.execute(
             """
-            SELECT conversation_key, title, source, tags, project, summary,
+            SELECT conversation_key, title, source, source_url, tags, project, summary,
                    messages, created_at, updated_at
             FROM conversations
             WHERE conversation_key = %s
@@ -141,7 +167,7 @@ def get_conversation(key: str) -> dict | None:
 
 
 _LIST_COLUMNS = """
-    conversation_key, title, source, tags, project, summary,
+    conversation_key, title, source, source_url, tags, project, summary,
     jsonb_array_length(messages) AS message_count,
     created_at, updated_at
 """
@@ -177,11 +203,11 @@ def search_conversations(query: str, limit: int) -> list[dict]:
     return [_isoformat(row) for row in rows]
 
 
-# --- 이하 대시보드/그룹화 파이프라인용 ---
+# --- derivation pipeline queries (used by grouping.refresh) ---
 
 
 def rows_needing_embedding() -> list[dict]:
-    """아직 임베딩에 반영되지 않은 메시지가 있는 대화들."""
+    """Conversations with messages not yet folded into their embedding."""
     with _connect() as conn:
         return conn.execute(
             """
@@ -227,7 +253,7 @@ def all_embedded() -> list[dict]:
 def set_metadata(
     row_id: int, title: str, tags: list[str], summary: str, anchor: list[float]
 ) -> None:
-    """파생 생성된 제목·태그·요약을 저장하고 앵커를 현재 벡터로 갱신한다."""
+    """Store derived title/tags/summary and move the anchor to the current vector."""
     with _connect() as conn:
         conn.execute(
             """
@@ -240,8 +266,9 @@ def set_metadata(
 
 
 def messages_excerpt(row_id: int, segments: int = 20) -> list[dict]:
-    """생성 입력용 표본: 대화를 구간으로 나눠 각 구간에서 역할별 최장 메시지를 1개씩 뽑는다.
-    user/assistant가 절반씩 들어가고, 대화 전체가 시간순으로 골고루 대표된다."""
+    """Sample for metadata generation: split the conversation into segments and take
+    the longest message per role from each — half user, half assistant, covering
+    the whole conversation in chronological order."""
     with _connect() as conn:
         row = conn.execute(
             "SELECT messages FROM conversations WHERE id = %s", (row_id,)
@@ -263,7 +290,7 @@ def messages_excerpt(row_id: int, segments: int = 20) -> list[dict]:
 
 
 def apply_tag_mapping(mapping: dict[str, str]) -> None:
-    """태그 병합표를 전체 대화에 적용한다 (예: 'MCP 연결' → 'MCP')."""
+    """Apply a tag merge map to every conversation (e.g. 'MCP server' -> 'MCP')."""
     with _connect() as conn:
         rows = conn.execute(
             "SELECT id, tags FROM conversations WHERE tags <> '{}'"
@@ -283,7 +310,7 @@ def apply_tag_mapping(mapping: dict[str, str]) -> None:
 
 
 def all_tags() -> list[str]:
-    """현재 아카이브에 존재하는 태그 어휘 (재사용 우선 생성용)."""
+    """Current tag vocabulary of the archive."""
     with _connect() as conn:
         return [
             r["tag"]
@@ -315,7 +342,7 @@ def projection_rows() -> list[dict]:
     with _connect() as conn:
         rows = conn.execute(
             """
-            SELECT conversation_key, title, project, tags, updated_at,
+            SELECT conversation_key, title, source, source_url, project, tags, updated_at,
                    cluster_small, cluster_small_label, cluster_big, cluster_big_label,
                    px, py, pz
             FROM conversations

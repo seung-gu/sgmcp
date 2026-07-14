@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>sgmcp — 대화 아카이브</title>
+<title>sgmcp — Conversation Archive</title>
 <script src="https://cdn.plot.ly/plotly-2.35.2.min.js"></script>
 <style>
   * { box-sizing: border-box; margin: 0; }
@@ -48,26 +48,26 @@
 </head>
 <body>
 <header>
-  <h1>sgmcp 대화 아카이브</h1>
+  <h1>sgmcp Conversation Archive</h1>
   <span id="status"></span>
-  <input type="search" id="q" placeholder="검색 (제목·요약·본문)">
-  <button id="refreshBtn" onclick="refreshGroups()">그룹 새로고침</button>
+  <input type="search" id="q" placeholder="Search (title · summary · content)">
+  <button id="refreshBtn" onclick="refreshGroups()">Refresh groups</button>
 </header>
 
 <div class="layout">
   <aside>
-    <h2>그룹</h2>
-    <div id="tree" class="muted">그룹 없음 — "그룹 새로고침"을 눌러 생성</div>
+    <h2>Groups</h2>
+    <div id="tree" class="muted">No groups yet — press "Refresh groups"</div>
   </aside>
   <main>
     <section>
-      <h2>임베딩 프로젝션 (3D)</h2>
+      <h2>Embedding projection (3D)</h2>
       <div id="plot"></div>
     </section>
     <section>
-      <h2>대화 목록 <span id="count" style="text-transform:none"></span></h2>
+      <h2>Conversations <span id="count" style="text-transform:none"></span></h2>
       <table>
-        <thead><tr><th>대화</th><th>소분류</th><th>출처 / 프로젝트 / 태그</th><th>메시지</th><th>갱신</th></tr></thead>
+        <thead><tr><th>Conversation</th><th>Group</th><th>Source / Project / Tags</th><th>Messages</th><th>Updated</th></tr></thead>
         <tbody id="rows"></tbody>
       </table>
     </section>
@@ -76,9 +76,10 @@
 
 <div id="modal" onclick="if(event.target===this)closeModal()">
   <div class="card">
-    <button class="close" onclick="closeModal()">닫기</button>
+    <button class="close" onclick="closeModal()">Close</button>
     <h3 id="mTitle"></h3>
     <div class="meta" id="mMeta"></div>
+    <div id="mReopen" style="margin-bottom:12px"></div>
     <div class="summary" id="mSummary" style="margin-bottom:14px"></div>
     <div id="mMessages"></div>
   </div>
@@ -113,7 +114,7 @@ function renderTable(rows) {
           ${(r.tags || []).map(t => `<span class="badge">${esc(t)}</span>`).join('')}</td>
       <td>${r.message_count}</td>
       <td>${fmtDate(r.updated_at)}</td>
-    </tr>`).join('') || '<tr><td colspan="5" class="muted">저장된 대화가 없습니다</td></tr>';
+    </tr>`).join('') || '<tr><td colspan="5" class="muted">No conversations saved</td></tr>';
 }
 
 function renderTree(proj) {
@@ -137,11 +138,11 @@ function renderPlot(proj) {
   const pts = proj.filter(p => p.px != null);
   const el = document.getElementById('plot');
   if (!pts.length) {
-    el.innerHTML = '<div class="muted" style="padding:30px">좌표 없음 — OPENAI_API_KEY 설정 후 "그룹 새로고침"을 누르면 생성됩니다</div>';
+    el.innerHTML = '<div class="muted" style="padding:30px">No coordinates — set OPENAI_API_KEY and press "Refresh groups"</div>';
     return;
   }
   const byCluster = {};
-  for (const p of pts) (byCluster[p.cluster_small_label ?? '미분류'] ??= []).push(p);
+  for (const p of pts) (byCluster[p.cluster_small_label ?? 'Uncategorized'] ??= []).push(p);
   const traces = Object.entries(byCluster).map(([label, items]) => ({
     name: label, type: 'scatter3d', mode: 'markers',
     x: items.map(i => i.px), y: items.map(i => i.py), z: items.map(i => i.pz),
@@ -164,12 +165,29 @@ async function openDetail(key) {
   document.getElementById('mMeta').textContent =
     [c.source, c.project && '📁 ' + c.project, (c.tags || []).join(', '), fmtDate(c.updated_at)]
       .filter(Boolean).join(' · ');
+  renderReopen(c);
   document.getElementById('mSummary').textContent = c.summary || '';
   document.getElementById('mMessages').innerHTML = (c.messages || []).map(m => `
     <div class="msg ${esc(m.role)}"><span class="role">${esc(m.role)}</span>${esc(m.content)}</div>`).join('');
   document.getElementById('modal').classList.add('open');
 }
 const closeModal = () => document.getElementById('modal').classList.remove('open');
+
+// "Reopen" affordance — driven only by source_url (filled by the client that saved:
+// claude.ai stores a chat URL, Claude Code stores a `claude --resume` command).
+// An http(s) URL becomes a link; anything else (a command) becomes copyable text.
+function renderReopen(c) {
+  const el = document.getElementById('mReopen');
+  if (!c.source_url) { el.innerHTML = ''; return; }
+  if (/^https?:\/\//.test(c.source_url)) {
+    el.innerHTML = `<a href="${esc(c.source_url)}" target="_blank" rel="noopener"
+      style="color:#8db4f5">↗ Open original conversation</a>`;
+  } else {
+    el.innerHTML = `<code style="background:#262b33;padding:4px 8px;border-radius:6px">${esc(c.source_url)}</code>
+      <button onclick="navigator.clipboard.writeText('${esc(c.source_url)}');this.textContent='copied'"
+      style="margin-left:8px;padding:4px 10px">copy</button>`;
+  }
+}
 
 let searchTimer;
 document.getElementById('q').addEventListener('input', e => {
@@ -182,10 +200,10 @@ document.getElementById('q').addEventListener('input', e => {
 
 async function refreshGroups() {
   const btn = document.getElementById('refreshBtn'), st = document.getElementById('status');
-  btn.disabled = true; st.textContent = '재계산 중…';
+  btn.disabled = true; st.textContent = 'Recomputing…';
   try {
     const r = await api('/api/refresh', { method: 'POST' });
-    st.textContent = `임베딩 ${r.embedded}건 갱신 · 대분류 ${r.clusters_big} · 소분류 ${r.clusters_small}`;
+    st.textContent = r.skipped ? 'No changes — groups kept' : `Embedded ${r.embedded} · regenerated ${r.metadata_generated} · big ${r.clusters_big} · small ${r.clusters_small}`;
     await load();
   } catch (err) { st.textContent = '⚠ ' + err.message; }
   btn.disabled = false;

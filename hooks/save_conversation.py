@@ -1,11 +1,11 @@
-# Claude Code Stop hook — 세션 transcript(JSONL)를 sgmcp 서버로 업서트한다.
+# Claude Code Stop hook — upserts the session transcript (JSONL) into the sgmcp server.
 #
-# 사용:
-#   (hook)     stdin으로 {"session_id", "transcript_path", ...}를 받아 해당 세션 적재
-#   (backfill) python hooks/save_conversation.py --backfill   # ~/.claude/projects/ 전체 일괄 적재
+# Usage:
+#   (hook)     receives {"session_id", "transcript_path", ...} on stdin, pushes that session
+#   (backfill) python hooks/save_conversation.py --backfill   # push every past session
 #
-# 실패해도 항상 exit 0 — Claude Code 세션을 방해하지 않는다.
-# 매 턴 전체 업서트라 누락된 턴은 다음 턴 실행이 자가 복구한다.
+# Always exits 0 — it must never disturb the Claude Code session.
+# Each turn re-upserts the full state, so any missed turn heals on the next one.
 
 import json
 import sys
@@ -17,7 +17,7 @@ SERVER = "https://sgmcp-seunggu.fly.dev"
 ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 LOG_PATH = Path.home() / ".claude" / "sgmcp-hook.log"
 
-# /clear 안내문 등 대화가 아닌 클라이언트 잡음
+# client noise that is not conversation content (e.g. /clear banners)
 NOISE_MARKERS = ("<command-name>", "<local-command-stdout>")
 
 
@@ -25,7 +25,7 @@ def _token() -> str:
     for line in ENV_PATH.read_text().splitlines():
         if line.startswith("INGEST_TOKEN="):
             return line.split("=", 1)[1].strip().strip("\"'")
-    raise RuntimeError(f"{ENV_PATH}에 INGEST_TOKEN이 없습니다")
+    raise RuntimeError(f"INGEST_TOKEN not found in {ENV_PATH}")
 
 
 def _text_of(content) -> str:
@@ -39,7 +39,7 @@ def _text_of(content) -> str:
 
 
 def _extract(transcript_path: Path) -> tuple[list[dict], str]:
-    """transcript에서 user/assistant의 순수 텍스트 턴만 추출한다."""
+    """Pull only the user/assistant text turns out of a transcript."""
     messages: list[dict] = []
     cwd = ""
     for raw in transcript_path.read_text().splitlines():
@@ -62,12 +62,20 @@ def _extract(transcript_path: Path) -> tuple[list[dict], str]:
 def _push(session_id: str, transcript_path: Path) -> str:
     messages, cwd = _extract(transcript_path)
     if not messages:
-        return f"{session_id}: 대화 없음, 건너뜀"
+        return f"{session_id}: no conversation, skipped"
+    # reopening needs the working directory too — `claude --resume` only finds
+    # sessions belonging to the current directory
+    resume = f"claude --resume {session_id}"
+    if cwd:
+        resume = f"cd {cwd} && {resume}"
     payload = {
         "conversation_key": f"cc-{session_id}",
         "messages": messages,
         "source": "claude-code",
         "project": Path(cwd).name if cwd else "",
+        # the dashboard shows source_url uniformly, so Claude Code fills in its
+        # resume command here (claude.ai fills in a URL)
+        "source_url": resume,
     }
     response = httpx.post(
         f"{SERVER}/api/ingest",
@@ -91,7 +99,7 @@ def main() -> None:
             try:
                 print(_push(path.stem, path))
             except Exception as e:
-                print(f"{path.name}: 실패 — {e}")
+                print(f"{path.name}: failed — {e}")
         return
     hook_input = json.load(sys.stdin)
     _log(_push(hook_input["session_id"], Path(hook_input["transcript_path"])))
@@ -102,7 +110,7 @@ if __name__ == "__main__":
         main()
     except Exception as e:
         try:
-            _log(f"오류: {e}")
+            _log(f"error: {e}")
         except Exception:
             pass
     sys.exit(0)

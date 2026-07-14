@@ -1,4 +1,4 @@
-# 대시보드 웹 라우트 — MCP와 같은 프로세스에서 서빙되지만 코드는 여기로 분리
+# Dashboard web routes — served by the same process as MCP, kept in their own module
 
 import os
 import secrets
@@ -25,7 +25,7 @@ def _unauthorized() -> JSONResponse:
 
 
 def register(mcp) -> None:
-    """FastMCP 앱에 대시보드 라우트를 등록한다."""
+    """Register the dashboard routes on the FastMCP app."""
 
     @mcp.custom_route("/", methods=["GET"])
     async def index(request: Request):

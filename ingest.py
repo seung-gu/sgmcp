@@ -1,4 +1,4 @@
-# 외부 프로그램(Claude Code hook 등)이 대화를 밀어넣는 쓰기 전용 문
+# Write-only door for external programs (the Claude Code hook) to push conversations
 
 import os
 import secrets
@@ -17,7 +17,7 @@ def _authorized(request: Request) -> bool:
 
 
 def register(mcp) -> None:
-    """FastMCP 앱에 ingest 라우트를 등록한다."""
+    """Register the ingest route on the FastMCP app."""
 
     @mcp.custom_route("/api/ingest", methods=["POST"])
     async def api_ingest(request: Request):
@@ -31,7 +31,8 @@ def register(mcp) -> None:
                 body["messages"],
                 body.get("source", ""),
                 body.get("project", ""),
+                body.get("source_url", ""),
             )
         except KeyError as e:
-            return JSONResponse({"error": f"필수 필드 누락: {e}"}, status_code=400)
+            return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
         return JSONResponse(result)

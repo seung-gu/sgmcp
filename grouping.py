@@ -1,24 +1,34 @@
-# 임베딩 생성 + 클러스터링 + 3D 투영 — 대시보드 그룹 뷰 재계산
+# The "Refresh groups" pipeline: incremental embedding, drift-gated metadata
+# generation, tag consolidation, clustering, and group naming.
 
 import json
 import os
 from collections import Counter
+from functools import cache
 
 import httpx
 import numpy as np
+from pydantic import BaseModel, Field
+from pydantic_ai import Agent, ModelRetry
 
 import db
 
 EMBED_MODEL = "text-embedding-3-small"
-NAMING_MODEL = "gpt-4.1-mini"  # 제목·태그·요약 생성용 경량 모델
-# 현재 평균과 앵커의 코사인이 이보다 낮아지면 제목·태그·요약 재생성.
-# 실측(2026-07-14): 마지막 10% 성장 ≈ 0.999(스킵), 2배 성장 ≈ 0.983~0.989(발동),
-# 다른 주제 25% 유입 ≈ 0.980~0.995(대체로 발동). 오발동 비용이 싸서 민감한 쪽으로 설정.
+GEN_MODEL = "openai:gpt-4.1-mini"  # metadata generation, tag merging, group naming
+
+# All derived text (titles, tags, summaries, group names) is written in this
+# language regardless of the conversation's language — the archive reads as one.
+ARCHIVE_LANGUAGE = os.environ.get("ARCHIVE_LANGUAGE", "Korean")
+
+# Regenerate metadata when cos(current mean, anchor) drops below this.
+# Measured 2026-07-14: last-10% growth ≈ 0.999 (skip), doubling ≈ 0.983–0.989 (fire),
+# 25% foreign-topic inflow ≈ 0.980–0.995 (mostly fire). A false fire costs one cheap
+# call, a missed fire costs stale metadata — so tuned to the sensitive side.
 DRIFT_MIN_COS = 0.99
-# 임계값은 센터링된 벡터의 실측 유사도 분포 기준 (같은 주제 0.40~0.92, 다른 주제 -0.43~-0.12)
-T_SMALL = 0.35  # 소분류 병합 임계 (cosine) — 대분류 소속은 좌표가 아니라 LLM 배정
-MIN_CHARS = 30  # 이보다 짧은 메시지("고마워" 등)는 대표 벡터 계산에서 제외
-MIN_GROUP_FOR_CENTERING = 4  # 이보다 작은 언어 그룹은 전체 평균으로 폴백
+
+T_SMALL = 0.35  # small-cluster merge threshold (cosine); big groups are LLM-assigned
+MIN_CHARS = 30  # messages shorter than this ("thanks", "ok") don't vote in the mean
+MIN_GROUP_FOR_CENTERING = 4  # smaller language groups fall back to the global mean
 
 
 def _embed_texts(texts: list[str]) -> list[list[float]]:
@@ -37,16 +47,19 @@ def _embed_texts(texts: list[str]) -> list[list[float]]:
 
 
 def _update_conversation_vector(row: dict, texts: list[str]) -> int:
-    """새 메시지들을 배치로 임베딩해 기존 가중 평균에 증분 병합. 임베딩된 벡터 수를 반환.
+    """Embed new messages and fold them into the running weighted mean.
 
-    메시지 벡터는 글자 수로 가중한다 — 긴 본문이 짧은 잡담보다 대화의 위치를 더 많이 결정.
-    embedded_vector_count 컬럼은 이 가중치(글자 수)의 누적 합을 저장한다.
-    벡터 전체를 메모리에 쌓지 않고 배치(100개)마다 합산 후 버린다 — 256MB 머신 OOM 방지.
+    Message vectors are weighted by character length — long substantive messages
+    should place the conversation more than short chatter (equal weighting let
+    frequent-but-short meta remarks dominate; see ARCHITECTURE.md).
+    `embedded_vector_count` stores the accumulated weight (total characters).
+    Vectors are summed per 100-message batch and discarded — bounded memory on
+    the 256MB machine.
     """
     old_weight = row["embedded_vector_count"]
     total_messages = len(row["messages"])
     if not texts:
-        # 새 메시지가 전부 필터에 걸림 — 카운터만 최신화
+        # every new message was filtered out — just advance the counters
         db.set_embedding_state(row["id"], row["embedding"], total_messages, old_weight)
         return 0
     weighted_sum = None
@@ -70,22 +83,214 @@ def _update_conversation_vector(row: dict, texts: list[str]) -> int:
     return len(texts)
 
 
-def _language_of(row: dict) -> str:
-    """제목+첫 메시지의 한글 비율로 언어 그룹을 정한다 (센터링 그룹 구분용)."""
-    text = row["title"] + " " + (row.get("sample") or "")
+# --- language helpers ---
+
+
+def _hangul_ratio(text: str) -> float:
     letters = [c for c in text if c.isalpha()]
     if not letters:
+        return 0.0
+    return sum(1 for c in letters if "가" <= c <= "힣") / len(letters)
+
+
+def _output_language_ok(text: str) -> bool:
+    """Cheap check that generated text is in ARCHIVE_LANGUAGE (ko/en only; else trust the prompt)."""
+    lang = ARCHIVE_LANGUAGE.strip().lower()
+    if lang in ("korean", "ko", "한국어"):
+        return _hangul_ratio(text) > 0.3
+    if lang in ("english", "en"):
+        return _hangul_ratio(text) < 0.05
+    return True
+
+
+def _language_of(row: dict) -> str:
+    """Language group of a conversation (for centering), from title + first message."""
+    text = row["title"] + " " + (row.get("sample") or "")
+    if not any(c.isalpha() for c in text):
         return "unknown"
-    hangul_ratio = sum(1 for c in letters if "가" <= c <= "힣") / len(letters)
-    return "ko" if hangul_ratio > 0.3 else "other"
+    return "ko" if _hangul_ratio(text) > 0.3 else "other"
+
+
+# --- generation agents (created lazily: constructing one requires OPENAI_API_KEY) ---
+
+
+class ConversationMetadata(BaseModel):
+    title: str = Field(max_length=80, description="one-line title")
+    tags: list[str] = Field(
+        min_length=1, max_length=5, description="topic tags, most important first"
+    )
+    summary: str = Field(max_length=600, description="2-4 sentence summary")
+
+
+class TagMergeMap(BaseModel):
+    merge: dict[str, str] = Field(default_factory=dict)
+
+
+class ClusterAssignment(BaseModel):
+    cluster_id: int
+    name: str = Field(min_length=1, max_length=60)
+    big_category: str = Field(min_length=1, max_length=60)
+
+
+class GroupNaming(BaseModel):
+    assignments: list[ClusterAssignment] = Field(default_factory=list)
+
+
+@cache
+def _metadata_agent() -> Agent:
+    agent = Agent(GEN_MODEL, output_type=ConversationMetadata, retries=2)
+
+    @agent.output_validator
+    def check_language(ctx, output: ConversationMetadata) -> ConversationMetadata:
+        if not _output_language_ok(output.title + " " + output.summary):
+            raise ModelRetry(f"Write the title and summary in {ARCHIVE_LANGUAGE}.")
+        return output
+
+    return agent
+
+
+@cache
+def _merge_agent() -> Agent:
+    return Agent(GEN_MODEL, output_type=TagMergeMap, retries=2)
+
+
+@cache
+def _naming_agent() -> Agent:
+    agent = Agent(GEN_MODEL, output_type=GroupNaming, retries=2)
+
+    @agent.output_validator
+    def check_language(ctx, output: GroupNaming) -> GroupNaming:
+        joined = " ".join(a.name + " " + a.big_category for a in output.assignments)
+        if output.assignments and not _output_language_ok(joined):
+            raise ModelRetry(f"Write group names in {ARCHIVE_LANGUAGE}.")
+        return output
+
+    return agent
+
+
+def _generate_metadata(messages: list[dict]) -> dict:
+    """Derive title/tags/summary from a conversation sample (one guarded call)."""
+    excerpt = "\n".join(f"[{m['role']}] {m['content'][:400]}" for m in messages)
+    prompt = (
+        f"Below is a sample of one conversation. Derive its metadata "
+        f"(title, tags, summary) in {ARCHIVE_LANGUAGE}; keep technical terms as-is.\n"
+        "Tags must name what the conversation is about, most important first. Do not tag "
+        "the tools or conventions used to conduct it (MCP, saving rules, instructions) "
+        "unless they are the actual subject.\n\n"
+        f"{excerpt}"
+    )
+    output = _metadata_agent().run_sync(prompt).output
+    return {
+        "title": output.title,
+        "tags": [t[:30] for t in output.tags],
+        "summary": output.summary,
+    }
+
+
+def _merge_suggestions(vocabulary: list[str]) -> dict[str, str]:
+    """Ask which tags are the same topic in different spellings (one call)."""
+    prompt = (
+        "Below are the tags used in a conversation archive. Merge only tags that "
+        "clearly refer to the same topic in different spellings; when unsure, leave them. "
+        "Pick the most concise, common spelling as the representative "
+        "(map: tag to drop -> representative).\n\n" + ", ".join(vocabulary)
+    )
+    return _merge_agent().run_sync(prompt).output.merge
+
+
+def _assign_and_name(
+    rows: list[dict], small_clusters: list[list[int]], changed: list[int], roofs: str
+) -> dict[int, dict] | None:
+    """Name changed small clusters and assign them to big categories (one call).
+
+    Unchanged clusters appear only as a candidate roster and are never renamed.
+    Returns {cluster_index: {"name", "big"}} or None on failure (caller falls back).
+    """
+    if not changed:
+        return {}
+    payload = {
+        str(ci): [rows[m]["tags"] or [] for m in small_clusters[ci]] for ci in changed
+    }
+    prompt = (
+        "You maintain the group tree of a conversation archive. For the CHANGED small "
+        "clusters below (and only those):\n"
+        "1) name each one after the theme running through its member tags "
+        f"(2-5 words, in {ARCHIVE_LANGUAGE})\n"
+        "2) assign it to one of the existing big categories by name, or coin a new "
+        "big category if none fits\n"
+        "Do not alter existing categories. Answer only for the changed clusters.\n\n"
+        f"Existing big categories (name — small clusters [representative tags]):\n{roofs}\n\n"
+        f"Changed small clusters (tags per member conversation, importance-ordered):\n"
+        f"{json.dumps(payload, ensure_ascii=False)}"
+    )
+    try:
+        output = _naming_agent().run_sync(prompt).output
+    except Exception:
+        return None
+    changed_set = set(changed)
+    return {
+        a.cluster_id: {"name": a.name[:40], "big": a.big_category[:40]}
+        for a in output.assignments
+        if a.cluster_id in changed_set
+    }
+
+
+def _consolidate_tags() -> dict[str, str]:
+    """Global tag merge: fetch a merge map, flatten chains, apply to the DB."""
+    vocabulary = db.all_tags()
+    if len(vocabulary) < 2:
+        return {}
+    try:
+        raw = _merge_suggestions(vocabulary)
+    except Exception:
+        return {}  # not fatal — the next refresh retries
+    mapping = {}
+    for source in raw:
+        target, seen = source, set()
+        while target in raw and target not in seen:
+            seen.add(target)
+            target = raw[target]
+        if source != target and source in vocabulary:
+            mapping[source] = target
+    if mapping:
+        db.apply_tag_mapping(mapping)
+    return mapping
+
+
+def _refresh_metadata(rows: list[dict]) -> set[int]:
+    """Regenerate title/tags/summary for conversations whose anchor is missing or
+    whose mean has drifted past the threshold. Returns the regenerated row ids."""
+    regenerated: set[int] = set()
+    for row in rows:
+        current = np.array(row["embedding"], dtype=np.float32)
+        anchor = row["tagged_embedding"]
+        if anchor is not None:
+            anchor_vec = np.array(anchor, dtype=np.float32)
+            cos = float(
+                current @ anchor_vec
+                / ((np.linalg.norm(current) * np.linalg.norm(anchor_vec)) + 1e-9)
+            )
+            if cos >= DRIFT_MIN_COS:
+                continue  # no meaningful movement since the anchor
+        try:
+            meta = _generate_metadata(db.messages_excerpt(row["id"]))
+            db.set_metadata(
+                row["id"], meta["title"], meta["tags"], meta["summary"],
+                [float(x) for x in current],
+            )
+            row["title"], row["tags"], row["summary"] = (
+                meta["title"], meta["tags"], meta["summary"],
+            )
+            regenerated.add(row["id"])
+        except Exception:
+            continue  # failed rows are retried by the next refresh
+    return regenerated
 
 
 def _center_by_language(matrix: np.ndarray, rows: list[dict]) -> np.ndarray:
-    """언어 그룹별 평균을 빼서 '언어·말투' 공통 성분을 제거한다.
-
-    같은 언어끼리 공유하는 방향이 소거돼 주제 차이만 남는다. 소수 그룹은
-    자기 평균을 빼면 왜곡되므로(1건이면 벡터가 0이 됨) 전체 평균으로 폴백.
-    """
+    """Subtract per-language means so cosine measures topical difference, not the
+    shared "same language, same register" component. Groups smaller than
+    MIN_GROUP_FOR_CENTERING fall back to the global mean (own-mean would degenerate)."""
     if len(rows) < MIN_GROUP_FOR_CENTERING:
         return matrix
     centered = matrix.copy()
@@ -104,7 +309,8 @@ def _center_by_language(matrix: np.ndarray, rows: list[dict]) -> np.ndarray:
 
 
 def _agglomerate(vectors: np.ndarray, threshold: float) -> list[list[int]]:
-    """중심 코사인 유사도가 threshold 이상인 클러스터 쌍을 반복 병합. 멤버 인덱스 목록 반환."""
+    """Repeatedly merge the cluster pair with the highest centroid cosine until
+    it drops below the threshold. Returns member-index lists."""
     clusters = [[i] for i in range(len(vectors))]
     centroids = vectors.copy()
     while len(clusters) > 1:
@@ -121,192 +327,45 @@ def _agglomerate(vectors: np.ndarray, threshold: float) -> list[list[int]]:
     return clusters
 
 
-def _generate_metadata(messages: list[dict]) -> dict:
-    """대화 표본을 읽고 제목·태그·요약을 자유롭게 생성한다 (경량 모델).
-    표기 통일은 여기서 하지 않는다 — 생성 후 _consolidate_tags가 전역에서 합친다."""
-    excerpt = "\n".join(f"[{m['role']}] {m['content'][:400]}" for m in messages)
-    prompt = (
-        "다음은 한 대화의 표본이다. 이 대화의 메타데이터를 JSON으로만 답하라:\n"
-        '{"title": "한 줄 제목 (한국어, 60자 이내)", '
-        '"tags": ["주제 태그 2~4개 — 중요한 것부터 순서대로"], '
-        '"summary": "핵심 내용·결론 요약 2~4문장 (한국어)"}\n'
-        "태그는 대화의 '내용 주제'를 나타내야 한다. 대화에 쓰인 도구나 규칙"
-        "(MCP, 지침, 대화 저장 등)은 그것 자체가 주제인 대화가 아니면 태그로 쓰지 마라.\n\n"
-        f"{excerpt}"
-    )
-    with httpx.Client(timeout=60) as client:
-        response = client.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}"},
-            json={
-                "model": NAMING_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "response_format": {"type": "json_object"},
-            },
-        )
-        response.raise_for_status()
-        data = json.loads(response.json()["choices"][0]["message"]["content"])
-    return {
-        "title": str(data.get("title", ""))[:80],
-        "tags": [str(t)[:30] for t in data.get("tags", [])][:5],
-        "summary": str(data.get("summary", ""))[:600],
-    }
-
-
-def _refresh_metadata(rows: list[dict]) -> set[int]:
-    """앵커가 없거나 드리프트가 임계를 넘은 대화의 제목·태그·요약을 재생성한다.
-    재생성된 대화의 id 집합을 반환한다 (이름 단계의 변경 감지에 쓰임)."""
-    regenerated: set[int] = set()
-    for row in rows:
-        current = np.array(row["embedding"], dtype=np.float32)
-        anchor = row["tagged_embedding"]
-        if anchor is not None:
-            anchor_vec = np.array(anchor, dtype=np.float32)
-            cos = float(
-                current @ anchor_vec
-                / ((np.linalg.norm(current) * np.linalg.norm(anchor_vec)) + 1e-9)
-            )
-            if cos >= DRIFT_MIN_COS:
-                continue  # 앵커 이후 의미 있는 이동 없음
-        try:
-            meta = _generate_metadata(db.messages_excerpt(row["id"]))
-            db.set_metadata(
-                row["id"], meta["title"], meta["tags"], meta["summary"],
-                [float(x) for x in current],
-            )
-            row["title"], row["tags"], row["summary"] = (
-                meta["title"], meta["tags"], meta["summary"],
-            )
-            regenerated.add(row["id"])
-        except Exception:
-            continue  # 실패한 대화는 다음 새로고침이 재시도
-    return regenerated
-
-
-def _merge_suggestions(vocabulary: list[str]) -> dict[str, str]:
-    """태그 목록에서 같은 뜻인 것들의 병합표를 받아온다 (경량 모델 1회 호출)."""
-    prompt = (
-        "다음은 대화 아카이브에 쓰인 태그 목록이다. 같은 주제를 다른 표기로 쓴 것들만 합쳐라.\n"
-        "확실히 같은 뜻일 때만 합치고, 애매하면 놔둬라. 대표 표기는 가장 간결하고 일반적인 것으로.\n"
-        'JSON으로만 답하라: {"merge": {"없앨태그": "대표태그", ...}} — 합칠 게 없으면 {"merge": {}}\n\n'
-        + ", ".join(vocabulary)
-    )
-    with httpx.Client(timeout=60) as client:
-        response = client.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={"Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}"},
-            json={
-                "model": NAMING_MODEL,
-                "messages": [{"role": "user", "content": prompt}],
-                "response_format": {"type": "json_object"},
-            },
-        )
-        response.raise_for_status()
-        data = json.loads(response.json()["choices"][0]["message"]["content"])
-    return {str(k): str(v) for k, v in data.get("merge", {}).items()}
-
-
-def _consolidate_tags() -> dict[str, str]:
-    """전역 태그 병합: 병합표를 받아 연쇄를 풀고 DB에 적용한다. 적용된 병합표 반환."""
-    vocabulary = db.all_tags()
-    if len(vocabulary) < 2:
-        return {}
-    try:
-        raw = _merge_suggestions(vocabulary)
-    except Exception:
-        return {}  # 병합 실패는 치명적이지 않음 — 다음 새로고침이 재시도
-    # 연쇄 병합(a→b, b→c)을 끝까지 따라가 평탄화
-    mapping = {}
-    for source in raw:
-        target, seen = source, set()
-        while target in raw and target not in seen:
-            seen.add(target)
-            target = raw[target]
-        if source != target and source in vocabulary:
-            mapping[source] = target
-    if mapping:
-        db.apply_tag_mapping(mapping)
-    return mapping
-
-
 def _roof_digest(rows: list[dict], small_clusters: list[list[int]], kept: dict) -> str:
-    """변경 없는 소분류들을 대분류별로 묶은 명단 — 이름 + 대표 태그 2개 (배정 후보용)."""
+    """Candidate roster of unchanged clusters, grouped by big category —
+    name plus two representative tags each (counting, no LLM)."""
     roofs: dict[str, list[str]] = {}
     for ci, (small_label, big_label) in kept.items():
         top = Counter(
             t for m in small_clusters[ci] for t in (rows[m]["tags"] or [])
         ).most_common(2)
         rep = ", ".join(tag for tag, _ in top)
-        roofs.setdefault(big_label or "미분류", []).append(f"{small_label}({rep})")
-    return "\n".join(f"- {big}: " + " / ".join(s) for big, s in roofs.items()) or "(아직 없음)"
-
-
-def _assign_and_name(
-    rows: list[dict], small_clusters: list[list[int]], changed: list[int], roofs: str
-) -> dict[int, dict] | None:
-    """변경된 소분류만 이름 짓고 대분류에 배정한다 (mini 1회). 실패 시 None."""
-    if not changed:
-        return {}
-    payload = {
-        str(ci): [rows[m]["tags"] or [] for m in small_clusters[ci]] for ci in changed
-    }
-    prompt = (
-        "대화 아카이브의 그룹 구조를 관리한다. 아래 '변경된 소분류'들에 대해서만:\n"
-        "1) 멤버 대화들의 태그(중요순)를 관통하는 소분류 이름을 지어라 (한국어 2~5단어)\n"
-        "2) 기존 대분류 중 알맞은 곳의 이름을 적거나, 어디에도 맞지 않으면 새 대분류 이름을 지어라\n"
-        "기존 대분류·소분류는 절대 바꾸지 마라. 변경된 것만 답하라.\n"
-        'JSON으로만 답하라: {"변경": {"소분류번호": {"이름": "...", "대분류": "..."}}}\n\n'
-        f"기존 대분류 명단 (이름 — 소분류들[대표 태그]):\n{roofs}\n\n"
-        f"변경된 소분류 (멤버 대화별 태그, 중요순):\n{json.dumps(payload, ensure_ascii=False)}"
-    )
-    try:
-        with httpx.Client(timeout=60) as client:
-            response = client.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={"Authorization": f"Bearer {os.environ['OPENAI_API_KEY']}"},
-                json={
-                    "model": NAMING_MODEL,
-                    "messages": [{"role": "user", "content": prompt}],
-                    "response_format": {"type": "json_object"},
-                },
-            )
-            response.raise_for_status()
-            data = json.loads(response.json()["choices"][0]["message"]["content"])
-        result = {}
-        for key, value in data.get("변경", {}).items():
-            result[int(key)] = {
-                "이름": str(value.get("이름", ""))[:40],
-                "대분류": str(value.get("대분류", ""))[:40],
-            }
-        return result
-    except Exception:
-        return None
+        roofs.setdefault(big_label or "(uncategorized)", []).append(f"{small_label}({rep})")
+    return "\n".join(f"- {big}: " + " / ".join(s) for big, s in roofs.items()) or "(none yet)"
 
 
 def _label(rows: list[dict], members: list[int]) -> str:
+    """Fallback label: the most common tag, else the shortest title."""
     tag_counts = Counter(tag for m in members for tag in (rows[m]["tags"] or []))
     if tag_counts:
         return tag_counts.most_common(1)[0][0]
     shortest = min((rows[m]["title"] for m in members), key=len)
-    return shortest[:30]
+    return shortest[:30] or rows[members[0]]["conversation_key"][:30]
 
 
 def _pca3(vectors: np.ndarray) -> np.ndarray:
     centered = vectors - vectors.mean(axis=0)
     _, _, vt = np.linalg.svd(centered, full_matrices=False)
     coords = centered @ vt[: min(3, vt.shape[0])].T
-    if coords.shape[1] < 3:  # 레코드가 아주 적으면 부족한 축을 0으로 채움
+    if coords.shape[1] < 3:  # pad missing axes when there are very few rows
         coords = np.pad(coords, ((0, 0), (0, 3 - coords.shape[1])))
     return coords
 
 
 def refresh() -> dict:
-    """오래된 임베딩 갱신 → 전체 재클러스터링 → 3D 좌표 재계산."""
+    """Embed new messages, then — only if any conversation drifted — regenerate its
+    metadata and recompute merging, clustering, naming and coordinates."""
     if not os.environ.get("OPENAI_API_KEY"):
-        raise RuntimeError("OPENAI_API_KEY가 설정되지 않았습니다 (목록/검색은 키 없이 동작합니다)")
+        raise RuntimeError("OPENAI_API_KEY is not set (list/search still work without it)")
 
-    # 대화별로 "아직 반영 안 된 새 메시지"만 임베딩해 증분 평균에 병합.
-    # 대화 단위로 즉시 저장하므로 중간에 실패해도 다음 실행이 이어서 처리한다.
+    # per-conversation incremental embedding; progress persists per conversation,
+    # so an interrupted run resumes where it stopped
     embedded_count = 0
     for row in db.rows_needing_embedding():
         new_messages = row["messages"][row["embedded_message_count"] :]
@@ -328,10 +387,9 @@ def refresh() -> dict:
             "clusters_big": 0,
         }
 
-    # 드리프트 판정 + 걸린 대화만 제목·태그·요약 재생성
+    # drift gate: if nothing fired, groups/names/coordinates stay exactly as they are
     regenerated = _refresh_metadata(rows)
     if not regenerated:
-        # 아무 대화도 안 걸림 → 그룹·이름·좌표 전부 지난번 그대로 (전역 작업 전체 생략)
         return {
             "embedded": embedded_count,
             "metadata_generated": 0,
@@ -339,10 +397,10 @@ def refresh() -> dict:
             "total": len(rows),
             "clusters_small": 0,
             "clusters_big": 0,
-            "skipped": "변화 없음",
+            "skipped": "no changes",
         }
 
-    # 전역 태그 병합: 같은 뜻 다른 표기를 대표 표기로 통일 (메모리의 rows에도 반영)
+    # global tag merge (also reflected in the in-memory rows used for labels)
     mapping = _consolidate_tags()
     if mapping:
         for row in rows:
@@ -358,7 +416,8 @@ def refresh() -> dict:
     matrix = _center_by_language(matrix, rows)
     small_clusters = _agglomerate(matrix, T_SMALL)
 
-    # 변경 감지: 멤버 구성이 지난번과 똑같고 재생성된 대화도 없는 소분류는 이름을 유지
+    # change detection: a cluster whose member set matches last time and contains
+    # no regenerated conversation keeps its stored name and big category
     prev_members: dict[int, set] = {}
     for row in rows:
         if row["cluster_small"] is not None:
@@ -380,16 +439,17 @@ def refresh() -> dict:
         else:
             changed.append(ci)
 
-    # 변경분만 이름 짓고 배정 (mini 1회). 실패하면 최빈 태그 이름으로 혼자 지붕
+    # name/assign only the changed clusters (one call); fallback: most-common tag,
+    # standing alone as its own big category, healed by a later refresh
     names = _assign_and_name(rows, small_clusters, changed, _roof_digest(rows, small_clusters, kept))
     small_label: dict[int, str] = {}
     big_label: dict[int, str] = {}
     for ci in range(len(small_clusters)):
         if ci in kept:
             small_label[ci], big_label[ci] = kept[ci]
-        elif names is not None and ci in names and names[ci]["이름"]:
-            small_label[ci] = names[ci]["이름"]
-            big_label[ci] = names[ci]["대분류"] or names[ci]["이름"]
+        elif names is not None and ci in names and names[ci]["name"]:
+            small_label[ci] = names[ci]["name"]
+            big_label[ci] = names[ci]["big"] or names[ci]["name"]
         else:
             fallback = _label(rows, small_clusters[ci])
             small_label[ci] = fallback
