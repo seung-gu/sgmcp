@@ -1,6 +1,7 @@
 # sgmcp
 
 개인용 커스텀 MCP(Model Context Protocol) 서버. FastMCP 기반이며 streamable HTTP transport로 동작한다.
+여러 LLM 클라이언트의 대화를 모아 자동 태깅·그룹화하는 아카이브 — 전체 구조와 설계 근거는 [ARCHITECTURE.md](ARCHITECTURE.md) 참고.
 
 ## 제공 툴
 
