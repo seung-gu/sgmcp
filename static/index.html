@@ -11,10 +11,13 @@
   header { display: flex; gap: 12px; align-items: center; padding: 14px 20px; border-bottom: 1px solid #2a2e35; }
   header h1 { font-size: 16px; margin-right: auto; }
   input[type=search] { background: #1e2127; border: 1px solid #33383f; color: #e6e8eb; border-radius: 8px; padding: 8px 12px; width: 280px; }
+  select { background: #1e2127; border: 1px solid #33383f; color: #e6e8eb; border-radius: 8px; padding: 8px 10px; }
   button { background: #2b6cf0; border: 0; color: #fff; border-radius: 8px; padding: 8px 14px; cursor: pointer; }
   button:disabled { opacity: .5; cursor: wait; }
   #status { color: #8b93a1; font-size: 13px; }
-  .layout { display: grid; grid-template-columns: 280px 1fr; min-height: calc(100vh - 61px); }
+  /* fixed height so the sidebar keeps the group tree visible while the
+     conversation list scrolls */
+  .layout { display: grid; grid-template-columns: 280px 1fr; grid-template-rows: 100%; height: calc(100vh - 61px); }
   aside { border-right: 1px solid #2a2e35; padding: 16px; overflow-y: auto; }
   aside h2, section h2 { font-size: 13px; color: #8b93a1; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 10px; }
   details { margin-bottom: 6px; }
@@ -28,10 +31,15 @@
   th { text-align: left; color: #8b93a1; font-weight: 500; padding: 8px; border-bottom: 1px solid #2a2e35; }
   td { padding: 10px 8px; border-bottom: 1px solid #22262c; vertical-align: top; }
   tr:hover td { background: #1b1e24; cursor: pointer; }
+  /* linked-hover highlight (same conversation pointed at in table, tree, plot) */
+  tr.hl td { background: #243450; }
+  .tree-item.hl { color: #fff; background: #243450; border-radius: 4px; }
+  summary.hl { color: #8db4f5; }
   .title { color: #fff; font-weight: 600; }
   .summary { color: #9aa3b0; font-size: 13px; margin-top: 3px; max-width: 640px; }
   .badge { display: inline-block; background: #262b33; color: #a9b2c0; border-radius: 20px; padding: 2px 9px; font-size: 12px; margin: 1px 3px 1px 0; }
   .badge.src { background: #24344d; color: #8db4f5; }
+  .badge.score { background: #2b4a37; color: #86d6a4; font-variant-numeric: tabular-nums; }
   #plot { height: 520px; background: #1a1d22; border-radius: 12px; }
   .muted { color: #6d7580; font-size: 13px; padding: 20px 0; }
   #modal { position: fixed; inset: 0; background: rgba(0,0,0,.6); display: none; align-items: flex-start; justify-content: center; padding: 40px 16px; overflow-y: auto; }
@@ -51,6 +59,10 @@
   <h1>sgmcp Conversation Archive</h1>
   <span id="status"></span>
   <input type="search" id="q" placeholder="Search (title · summary · content)">
+  <select id="mode" title="Text: literal match · Meaning: closest by embedding">
+    <option value="text">Text</option>
+    <option value="meaning">Meaning</option>
+  </select>
   <button id="refreshBtn" onclick="refreshGroups()">Refresh groups</button>
 </header>
 
@@ -102,11 +114,13 @@ async function api(path, opts) {
 
 const fmtDate = iso => iso ? iso.slice(0, 16).replace('T', ' ') : '';
 
-function renderTable(rows) {
+function renderTable(rows, emptyMessage = 'No conversations saved') {
   document.getElementById('count').textContent = `(${rows.length})`;
   document.getElementById('rows').innerHTML = rows.map(r => `
-    <tr onclick="openDetail('${esc(r.conversation_key)}')">
-      <td><div class="title">${esc(r.title || r.conversation_key)}</div>
+    <tr data-key="${esc(r.conversation_key)}" onclick="openDetail('${esc(r.conversation_key)}')"
+        onmouseenter="hoverSet('${esc(r.conversation_key)}', 'table')" onmouseleave="hoverClear()">
+      <td>${r.similarity != null ? `<span class="badge score">${Math.round(r.similarity * 100)}%</span> ` : ''}
+          <span class="title">${esc(r.title || r.conversation_key)}</span>
           <div class="summary">${esc(r.summary)}</div></td>
       <td>${esc(projByKey[r.conversation_key]?.cluster_small_label ?? '—')}</td>
       <td>${r.source ? `<span class="badge src">${esc(r.source)}</span>` : ''}
@@ -114,7 +128,7 @@ function renderTable(rows) {
           ${(r.tags || []).map(t => `<span class="badge">${esc(t)}</span>`).join('')}</td>
       <td>${r.message_count}</td>
       <td>${fmtDate(r.updated_at)}</td>
-    </tr>`).join('') || '<tr><td colspan="5" class="muted">No conversations saved</td></tr>';
+    </tr>`).join('') || `<tr><td colspan="5" class="muted">${esc(emptyMessage)}</td></tr>`;
 }
 
 function renderTree(proj) {
@@ -129,7 +143,8 @@ function renderTree(proj) {
     <details open><summary>${esc(big)}</summary>
       ${Object.entries(smalls).map(([small, items]) => `
         <details><summary>${esc(small)} (${items.length})</summary>
-          ${items.map(i => `<span class="tree-item" onclick="openDetail('${esc(i.conversation_key)}')">${esc(i.title)}</span>`).join('')}
+          ${items.map(i => `<span class="tree-item" data-key="${esc(i.conversation_key)}" onclick="scrollToRow('${esc(i.conversation_key)}')"
+            onmouseenter="hoverSet('${esc(i.conversation_key)}', 'tree')" onmouseleave="hoverClear()">${esc(i.title)}</span>`).join('')}
         </details>`).join('')}
     </details>`).join('');
 }
@@ -138,6 +153,7 @@ function renderPlot(proj) {
   const pts = proj.filter(p => p.px != null);
   const el = document.getElementById('plot');
   if (!pts.length) {
+    plotEl = null;
     el.innerHTML = '<div class="muted" style="padding:30px">No coordinates — set OPENAI_API_KEY and press "Refresh groups"</div>';
     return;
   }
@@ -150,13 +166,60 @@ function renderPlot(proj) {
     hovertemplate: '%{text}<extra>' + label + '</extra>',
     marker: { size: 5, opacity: .85 },
   }));
+  // last trace = a single white ring that setRing() moves onto the hovered conversation
+  traces.push({ type: 'scatter3d', mode: 'markers', x: [], y: [], z: [],
+    marker: { size: 12, color: '#ffffff', symbol: 'circle-open' },
+    hoverinfo: 'skip', showlegend: false });
   Plotly.newPlot(el, traces, {
     paper_bgcolor: '#1a1d22', font: { color: '#c9cdd3' },
     margin: { l: 0, r: 0, t: 10, b: 0 },
     scene: { xaxis: {title:''}, yaxis: {title:''}, zaxis: {title:''} },
     legend: { orientation: 'h' },
   }, { displayModeBar: false });
-  el.on('plotly_click', d => openDetail(d.points[0].customdata));
+  plotEl = el; ringIndex = traces.length - 1; ringKey = null;
+  el.on('plotly_click', d => scrollToRow(d.points[0].customdata));
+  el.on('plotly_hover', d => hoverSet(d.points[0].customdata, 'plot'));
+  el.on('plotly_unhover', hoverClear);
+}
+
+// Linked hover — pointing at a conversation in any view (table row, tree item,
+// projection point) highlights the same conversation in the other two.
+// Highlight only, no auto-scroll: scrolling would push the projection out of view.
+let plotEl = null, ringIndex = null, ringKey = null;
+
+function setRing(key) {
+  if (!plotEl || ringIndex == null || key === ringKey) return;
+  ringKey = key;
+  const p = key ? projByKey[key] : null;
+  const on = p && p.px != null;
+  Plotly.restyle(plotEl, { x: [on ? [p.px] : []], y: [on ? [p.py] : []], z: [on ? [p.pz] : []] }, [ringIndex]);
+}
+
+function hoverSet(key, source) {
+  hoverClear();
+  const q = CSS.escape(key);
+  const row = document.querySelector(`#rows tr[data-key="${q}"]`);
+  if (row) row.classList.add('hl');
+  const item = document.querySelector(`.tree-item[data-key="${q}"]`);
+  if (item) {
+    const small = item.closest('details');
+    const big = small && small.parentElement.closest('details');
+    item.classList.add('hl');
+    for (const d of [small, big]) d?.querySelector(':scope > summary')?.classList.add('hl');
+  }
+  setRing(source === 'plot' ? null : key);  // on the plot itself the hover label already marks the point
+}
+
+function hoverClear() {
+  document.querySelectorAll('.hl').forEach(e => e.classList.remove('hl'));
+  setRing(null);
+}
+
+// tree / projection clicks jump the conversation list to that row (details
+// open from a table-row click only)
+function scrollToRow(key) {
+  document.querySelector(`#rows tr[data-key="${CSS.escape(key)}"]`)
+    ?.scrollIntoView({ block: 'center', behavior: 'smooth' });
 }
 
 async function openDetail(key) {
@@ -189,14 +252,27 @@ function renderReopen(c) {
   }
 }
 
+async function runSearch() {
+  const q = document.getElementById('q').value.trim();
+  const st = document.getElementById('status');
+  if (!q) { st.textContent = ''; renderTable(allRows); return; }
+  const mode = document.getElementById('mode').value;
+  try {
+    // meaning-search drops weak matches rather than padding the list, so an empty
+    // result means "nothing close enough", not "nothing indexed"
+    renderTable(await api(`/api/search?q=${encodeURIComponent(q)}&mode=${mode}`),
+      mode === 'meaning' ? 'Nothing close enough — try different words, or switch to Text'
+                         : 'No conversation contains that text');
+    st.textContent = '';
+  } catch (err) { st.textContent = '⚠ ' + err.message; }
+}
+
 let searchTimer;
-document.getElementById('q').addEventListener('input', e => {
+document.getElementById('q').addEventListener('input', () => {
   clearTimeout(searchTimer);
-  searchTimer = setTimeout(async () => {
-    const q = e.target.value.trim();
-    renderTable(q ? await api('/api/search?q=' + encodeURIComponent(q)) : allRows);
-  }, 250);
+  searchTimer = setTimeout(runSearch, 250);
 });
+document.getElementById('mode').addEventListener('change', runSearch);
 
 async function refreshGroups() {
   const btn = document.getElementById('refreshBtn'), st = document.getElementById('status');

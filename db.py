@@ -6,6 +6,8 @@ import psycopg
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
+EMBED_DIMENSIONS = 1536  # text-embedding-3-small
+
 _SCHEMA = [
     """
     CREATE TABLE IF NOT EXISTS conversations (
@@ -34,6 +36,32 @@ _SCHEMA = [
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS embedded_vector_count INT NOT NULL DEFAULT 0",
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS tagged_embedding REAL[]",
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS source_url TEXT NOT NULL DEFAULT ''",
+    # embedding_vec mirrors `embedding` in pgvector's own type so semantic search can
+    # use the HNSW index; `embedding` stays the canonical column the pipeline reads.
+    "CREATE EXTENSION IF NOT EXISTS vector",
+    f"ALTER TABLE conversations ADD COLUMN IF NOT EXISTS embedding_vec vector({EMBED_DIMENSIONS})",
+    """
+    CREATE INDEX IF NOT EXISTS conversations_embedding_hnsw
+        ON conversations USING hnsw (embedding_vec vector_cosine_ops)
+    """,
+    # Search index. A conversation's average vector answers "what is this about",
+    # which is what clustering needs but too blurry to search: measured 48% top-1.
+    # Scoring a conversation by its best-matching passage instead gives 68%, so
+    # search runs against these — body passages plus one title+summary card.
+    f"""
+    CREATE TABLE IF NOT EXISTS conversation_chunks (
+        conversation_id BIGINT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        kind TEXT NOT NULL,
+        chunk_index INT NOT NULL,
+        vec vector({EMBED_DIMENSIONS}) NOT NULL,
+        PRIMARY KEY (conversation_id, kind, chunk_index)
+    )
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS conversation_chunks_hnsw
+        ON conversation_chunks USING hnsw (vec vector_cosine_ops)
+    """,
+    "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS chunked_message_count INT NOT NULL DEFAULT 0",
 ]
 
 # Ask the model to request the conversation URL when it's still missing and the
@@ -90,6 +118,9 @@ def save_conversation(
                     embedding = CASE WHEN jsonb_array_length(EXCLUDED.messages)
                                           < conversations.embedded_message_count
                                      THEN NULL ELSE conversations.embedding END,
+                    embedding_vec = CASE WHEN jsonb_array_length(EXCLUDED.messages)
+                                              < conversations.embedded_message_count
+                                         THEN NULL ELSE conversations.embedding_vec END,
                     embedded_message_count = CASE WHEN jsonb_array_length(EXCLUDED.messages)
                                                        < conversations.embedded_message_count
                                                   THEN 0 ELSE conversations.embedded_message_count END,
@@ -203,6 +234,42 @@ def search_conversations(query: str, limit: int) -> list[dict]:
     return [_isoformat(row) for row in rows]
 
 
+def _vector_literal(vector: list[float]) -> str:
+    return "[" + ",".join(str(float(x)) for x in vector) + "]"
+
+
+def semantic_search(vector: list[float], limit: int, min_similarity: float) -> list[dict]:
+    """Rank conversations by meaning rather than spelling: pull the closest passages
+    (HNSW does this), then score each conversation by its single best one.
+
+    Vector search always returns *something*, so without a floor every query lists
+    the whole archive. Anything below min_similarity is dropped rather than shown."""
+    literal = _vector_literal(vector)
+    with _connect() as conn:
+        rows = conn.execute(
+            f"""
+            WITH nearest AS (
+                SELECT conversation_id, min(distance) AS distance
+                FROM (
+                    SELECT conversation_id, vec <=> %s::vector AS distance
+                    FROM conversation_chunks
+                    ORDER BY vec <=> %s::vector
+                    LIMIT %s
+                ) close_chunks
+                GROUP BY conversation_id
+            )
+            SELECT {_LIST_COLUMNS}, 1 - nearest.distance AS similarity
+            FROM nearest
+            JOIN conversations ON conversations.id = nearest.conversation_id
+            WHERE nearest.distance <= %s
+            ORDER BY nearest.distance
+            LIMIT %s
+            """,
+            (literal, literal, limit * 20, 1 - min_similarity, limit),
+        ).fetchall()
+    return [_isoformat(row) for row in rows]
+
+
 # --- derivation pipeline queries (used by grouping.refresh) ---
 
 
@@ -227,41 +294,132 @@ def set_embedding_state(
             """
             UPDATE conversations
             SET embedding = %s::real[],
+                embedding_vec = %s::real[]::vector,
                 embedded_message_count = %s,
                 embedded_vector_count = %s,
                 embedded_at = now()
             WHERE id = %s
             """,
-            (mean, message_count, vector_count, row_id),
+            (mean, mean, message_count, vector_count, row_id),
         )
 
 
-def all_embedded() -> list[dict]:
+def all_embedded(drift_min_cos: float) -> list[dict]:
+    """Text fields of every embedded conversation plus a `drifted` flag.
+
+    Drift is measured in Postgres so the vectors stay there — the metadata phase
+    only needs to know whether each conversation moved, not by how much. Missing
+    anchor counts as drifted (never tagged yet)."""
     with _connect() as conn:
         return conn.execute(
             """
-            SELECT id, conversation_key, title, tags, summary, embedding, tagged_embedding,
+            SELECT id, conversation_key, title, tags, summary,
                    cluster_small, cluster_small_label, cluster_big_label,
-                   left(messages->0->>'content', 200) AS sample
+                   left(messages->0->>'content', 200) AS sample,
+                   (tagged_embedding IS NULL
+                    OR (embedding::vector <=> tagged_embedding::vector) > %s) AS drifted
             FROM conversations
             WHERE embedding IS NOT NULL
+            ORDER BY id
+            """,
+            (1 - drift_min_cos,),
+        ).fetchall()
+
+
+def embeddings_by_id() -> dict[int, list[float]]:
+    """Every embedding, keyed by row id — fetched only for clustering and the 3D
+    projection, which are the two steps that genuinely need all vectors at once."""
+    with _connect() as conn:
+        return {
+            row["id"]: row["embedding"]
+            for row in conn.execute(
+                "SELECT id, embedding FROM conversations WHERE embedding IS NOT NULL"
+            ).fetchall()
+        }
+
+
+def rows_needing_chunks() -> list[dict]:
+    """Conversations whose search passages are missing or behind the message list."""
+    with _connect() as conn:
+        return conn.execute(
+            """
+            SELECT id, messages
+            FROM conversations
+            WHERE chunked_message_count <> jsonb_array_length(messages)
             ORDER BY id
             """
         ).fetchall()
 
 
-def set_metadata(
-    row_id: int, title: str, tags: list[str], summary: str, anchor: list[float]
-) -> None:
-    """Store derived title/tags/summary and move the anchor to the current vector."""
+def rows_needing_card() -> list[dict]:
+    """Conversations that already have metadata but no card yet — covers both the
+    first run over an existing archive and any conversation whose card was lost."""
+    with _connect() as conn:
+        return conn.execute(
+            """
+            SELECT id, title, tags, summary
+            FROM conversations
+            WHERE title <> ''
+              AND NOT EXISTS (
+                  SELECT 1 FROM conversation_chunks
+                  WHERE conversation_id = conversations.id AND kind = 'card'
+              )
+            ORDER BY id
+            """
+        ).fetchall()
+
+
+def replace_body_chunks(row_id: int, vectors: list[list[float]], message_count: int) -> None:
+    """Swap in a fresh set of body passages for one conversation."""
+    with _connect() as conn:
+        conn.execute(
+            "DELETE FROM conversation_chunks WHERE conversation_id = %s AND kind = 'body'",
+            (row_id,),
+        )
+        with conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO conversation_chunks (conversation_id, kind, chunk_index, vec)"
+                " VALUES (%s, 'body', %s, %s::vector)",
+                [(row_id, i, _vector_literal(v)) for i, v in enumerate(vectors)],
+            )
+        conn.execute(
+            "UPDATE conversations SET chunked_message_count = %s WHERE id = %s",
+            (message_count, row_id),
+        )
+
+
+def replace_card_chunk(row_id: int, vector: list[float]) -> None:
+    """Swap in the title+summary+tags card, which searches better than body text
+    for broad queries ('what was that embedded systems talk about')."""
+    with _connect() as conn:
+        conn.execute(
+            "DELETE FROM conversation_chunks WHERE conversation_id = %s AND kind = 'card'",
+            (row_id,),
+        )
+        conn.execute(
+            "INSERT INTO conversation_chunks (conversation_id, kind, chunk_index, vec)"
+            " VALUES (%s, 'card', 0, %s::vector)",
+            (row_id, _vector_literal(vector)),
+        )
+
+
+def set_metadata(row_id: int, title: str, tags: list[str], summary: str) -> None:
+    """Store derived title/tags/summary, move the anchor to the current vector, and
+    drop the search card in the same transaction — it was built from the old text.
+    A missing card is rebuilt by the next refresh; a silently stale one never would
+    be, since the anchor has already moved and drift won't fire again."""
     with _connect() as conn:
         conn.execute(
             """
             UPDATE conversations
-            SET title = %s, tags = %s, summary = %s, tagged_embedding = %s::real[]
+            SET title = %s, tags = %s, summary = %s, tagged_embedding = embedding
             WHERE id = %s
             """,
-            (title, tags, summary, anchor, row_id),
+            (title, tags, summary, row_id),
+        )
+        conn.execute(
+            "DELETE FROM conversation_chunks WHERE conversation_id = %s AND kind = 'card'",
+            (row_id,),
         )
 
 
@@ -290,7 +448,11 @@ def messages_excerpt(row_id: int, segments: int = 20) -> list[dict]:
 
 
 def apply_tag_mapping(mapping: dict[str, str]) -> None:
-    """Apply a tag merge map to every conversation (e.g. 'MCP server' -> 'MCP')."""
+    """Apply a tag merge map to every conversation (e.g. 'MCP server' -> 'MCP').
+
+    Tags are part of the search card, so a conversation whose tags change loses its
+    card here and gets a fresh one built later in the same refresh — this reaches
+    conversations that never drifted and so never regenerate metadata."""
     with _connect() as conn:
         rows = conn.execute(
             "SELECT id, tags FROM conversations WHERE tags <> '{}'"
@@ -306,6 +468,11 @@ def apply_tag_mapping(mapping: dict[str, str]) -> None:
                     cur.execute(
                         "UPDATE conversations SET tags = %s WHERE id = %s",
                         (merged, row["id"]),
+                    )
+                    cur.execute(
+                        "DELETE FROM conversation_chunks"
+                        " WHERE conversation_id = %s AND kind = 'card'",
+                        (row["id"],),
                     )
 
 

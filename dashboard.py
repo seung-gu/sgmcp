@@ -46,7 +46,12 @@ def register(mcp) -> None:
         query = request.query_params.get("q", "").strip()
         if not query:
             return JSONResponse([])
-        return JSONResponse(await run_in_threadpool(db.search_conversations, query, 50))
+        if request.query_params.get("mode") != "meaning":
+            return JSONResponse(await run_in_threadpool(db.search_conversations, query, 50))
+        try:
+            return JSONResponse(await run_in_threadpool(grouping.semantic_search, query, 50))
+        except Exception as e:  # missing API key, embedding call failed
+            return JSONResponse({"error": f"semantic search failed: {e}"}, status_code=400)
 
     @mcp.custom_route("/api/conversation/{key}", methods=["GET"])
     async def api_conversation(request: Request):

@@ -93,11 +93,13 @@ zero drift it makes **none**.
 ```mermaid
 flowchart TD
     S([Refresh groups]) --> E["embed new messages only<br/>skip under 30 chars · length-weighted mean"]
-    E --> G{"drift check<br/>no anchor, or cosine below 0.99"}
+    E --> C["re-index search passages of conversations that gained messages<br/>(ahead of the gate — new text must be findable even without drift)"]
+    C --> G{"drift check<br/>no anchor, or cosine below 0.99"}
     G -- "none" --> X(["done — groups, names, coordinates all kept<br/>zero LLM calls"])
-    G -- "one or more" --> M["🤖 regenerate drifted conversations only<br/>sample of 40 → title · tags (importance-ordered) · summary<br/>anchor moves to the current vector"]
-    M --> T["🤖 tag merge — one global call<br/>unify same topic, different spellings"]
-    T --> K["small clusters (geometry)<br/>per-language centering · cosine 0.35"]
+    G -- "one or more" --> M["🤖 regenerate drifted conversations only<br/>sample of 40 → title · tags (importance-ordered) · summary<br/>anchor moves to the current vector · stale search card dropped"]
+    M --> T["🤖 tag merge — one global call<br/>unify same topic, different spellings<br/>retagged conversations drop their card too"]
+    T --> RC["rebuild every missing search card<br/>(now that title and tags are final)"]
+    RC --> K["small clusters (geometry)<br/>per-language centering · cosine 0.35"]
     K --> CH{"per cluster:<br/>same members as last time,<br/>none regenerated?"}
     CH -- "kept" --> KEEP["name and big category unchanged<br/>(appears only in the candidate roster)"]
     CH -- "changed" --> N["🤖 name and assign — one global call<br/>changed clusters' raw tags + roster (names, top tags)<br/>fallback: most-common tag, own category"]
@@ -108,13 +110,38 @@ flowchart TD
 Sample = split the conversation into 20 segments, take the longest user and
 assistant message from each (max 40 messages, 400 chars each).
 
+## Search
+
+Two modes share one box. **Text** is literal (`ILIKE` over title, summary and raw
+messages) — right for an exact string like an error message. **Meaning** embeds the
+query and ranks by cosine distance, served by an HNSW index in pgvector.
+
+Meaning-search deliberately does *not* use the conversation's average vector. An
+average answers "what is this conversation about overall", which is what clustering
+needs but too blurred to search: it also creates a hub conversation that wins
+unrelated queries. Instead each conversation is cut into ~1500-character passages,
+plus one card of `title + summary + tags`, and a conversation scores as its single
+best-matching passage — "does this conversation contain what I'm asking about".
+
+Passages are re-indexed when a conversation gains messages, ahead of the drift gate.
+Cards follow a delete-and-rebuild rule: anything that changes their input text
+(metadata regeneration, the tag merge) deletes the card row in the same transaction,
+and a later pass rebuilds every missing card. A missing card is self-healing — the
+next refresh notices and rebuilds it — whereas a silently stale one is not, because
+the anchor has already moved and drift will never fire for it again.
+
 ## Data model — three layers of columns
 
 | Layer | Columns | Written by |
 |---|---|---|
 | Canonical (immutable) | `conversation_key` `messages` `source` `project` | clients |
 | Derived — LLM | `title` `tags` (importance-ordered array) `summary` `tagged_embedding` (anchor) | refresh, drift-gated |
-| Derived — math | `embedding` (weighted mean) `embedded_*_count` `cluster_small/big(_label)` `px py pz` | refresh |
+| Derived — math | `embedding` (weighted mean) `embedding_vec` (same, pgvector-typed) `embedded_*_count` `cluster_small/big(_label)` `px py pz` | refresh |
+| Search index | `conversation_chunks(conversation_id, kind, chunk_index, vec)` + `chunked_message_count` | refresh |
+
+Drift is evaluated in SQL (`embedding <=> tagged_embedding`), so the metadata phase
+never carries vectors in memory — they are loaded only for clustering and the 3D
+projection.
 
 ## Design principles
 
@@ -139,6 +166,7 @@ assistant message from each (max 40 messages, 400 chars each).
 | big categories = LLM | "object detection and multi-agent are both AI" is classification knowledge, not geometry — the geometric version failed with 7 near-singletons |
 | small-cluster threshold 0.35 | placed in the measured valley of the centered similarity distribution |
 | `ARCHIVE_LANGUAGE` | all derived text in one configured language — keeps the tag vocabulary from splitting per language; enforced by an output validator with retry |
+| search passages of 1500 chars | 66 queries with known answers, top-1: conversation average 48%, per-message 59%, passages **68%** (live re-check 70%). Single messages lack context, whole conversations blur together. Passages also cost a fifth of per-message storage — 24 MB vs ~65 MB for this archive |
 
 ## Operations
 
@@ -160,3 +188,7 @@ assistant message from each (max 40 messages, 400 chars each).
 - Unchanged groups never get re-assigned — use the full rebuild above when stale
 - Conversations with only short messages (< 30 chars) have no embedding and don't
   appear in groups or on the map
+- Meaning-search still misses roughly 3 in 10 first hits; most of those return a
+  sibling conversation on the same topic rather than something unrelated
+- `embedding_vec` is kept in sync but nothing reads it yet — it is the column a
+  "conversations similar to this one" feature would use

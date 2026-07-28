@@ -1,8 +1,11 @@
 # The "Refresh groups" pipeline: incremental embedding, drift-gated metadata
 # generation, tag consolidation, clustering, and group naming.
+# Also hosts semantic search, which shares the embedding call.
 
 import json
 import os
+import re
+import time
 from collections import Counter
 from functools import cache
 
@@ -26,24 +29,103 @@ ARCHIVE_LANGUAGE = os.environ.get("ARCHIVE_LANGUAGE", "Korean")
 # call, a missed fire costs stale metadata — so tuned to the sensitive side.
 DRIFT_MIN_COS = 0.99
 
-T_SMALL = 0.35  # small-cluster merge threshold (cosine); big groups are LLM-assigned
+# Small-cluster merge threshold (centered cosine); big groups are LLM-assigned.
+# Re-measured 2026-07-29 over 36 conversations: singletons stay flat at 5 from 0.26
+# to 0.30, jump to 7 at 0.31 and to 11 at 0.32 — so 0.30 is the last stable value
+# before the archive shatters. Below 0.26 unrelated topics start fusing (object
+# detection absorbed the interview-prep conversations at 0.25). The previous 0.35
+# was tuned against 15 conversations and had drifted past the cliff.
+T_SMALL = 0.30
 MIN_CHARS = 30  # messages shorter than this ("thanks", "ok") don't vote in the mean
 MIN_GROUP_FOR_CENTERING = 4  # smaller language groups fall back to the global mean
 
+# Consecutive messages are glued into passages of about this many characters before
+# being embedded for search. Measured 2026-07-15 over 66 queries with known answers:
+# whole-conversation average 48% top-1, per-message 59%, these passages 68% — single
+# messages are too short to carry context, whole conversations too blurred. Passages
+# also cost a fifth of per-message storage (13 MB vs 65 MB here).
+CHUNK_CHARS = 1500
+
+# Meaning-search floor. Measured 2026-07-29 over the same 66 queries: right answers
+# scored a median 0.486 (lowest 0.274), everything else a median 0.285. Cutting here
+# keeps 98% of the right answers while removing 59% of the noise — without it every
+# query returns the whole archive, since vector search always ranks something first.
+MIN_SIMILARITY = 0.30
+
 
 def _embed_texts(texts: list[str]) -> list[list[float]]:
+    """Search passages are long enough that a full batch can exceed the per-minute
+    token allowance, so a 429 is waited out rather than failing the whole refresh."""
     api_key = os.environ["OPENAI_API_KEY"]
     vectors: list[list[float]] = []
-    with httpx.Client(timeout=60) as client:
+    with httpx.Client(timeout=120) as client:
         for i in range(0, len(texts), 100):
-            response = client.post(
-                "https://api.openai.com/v1/embeddings",
-                headers={"Authorization": f"Bearer {api_key}"},
-                json={"model": EMBED_MODEL, "input": texts[i : i + 100]},
-            )
+            for attempt in range(6):
+                response = client.post(
+                    "https://api.openai.com/v1/embeddings",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    json={"model": EMBED_MODEL, "input": texts[i : i + 100]},
+                )
+                if response.status_code != 429:
+                    break
+                time.sleep(2**attempt)
             response.raise_for_status()
             vectors.extend(item["embedding"] for item in response.json()["data"])
     return vectors
+
+
+def _passages(messages: list[dict]) -> list[str]:
+    """Glue consecutive messages into ~CHUNK_CHARS passages, skipping the short
+    chatter that MIN_CHARS already excludes from the mean."""
+    passages, buf = [], ""
+    for message in messages:
+        content = (message.get("content") or "").strip()
+        if len(content) < MIN_CHARS:
+            continue
+        buf += content[:6000] + "\n"
+        if len(buf) >= CHUNK_CHARS:
+            passages.append(buf[:6000])
+            buf = ""
+    if buf.strip():
+        passages.append(buf[:6000])
+    return passages
+
+
+def _card(title: str, tags: list[str], summary: str) -> str:
+    return f"{title}. {summary} {' '.join(tags or [])}"
+
+
+def _refresh_body_chunks() -> int:
+    """Re-embed search passages for conversations that gained messages. The counter
+    starts at zero, so the first run indexes the whole archive."""
+    rebuilt = 0
+    for row in db.rows_needing_chunks():
+        passages = _passages(row["messages"])
+        vectors = _embed_texts(passages) if passages else []
+        db.replace_body_chunks(row["id"], vectors, len(row["messages"]))
+        rebuilt += len(vectors)
+    return rebuilt
+
+
+def _refresh_cards() -> int:
+    """Build every missing card. Whatever invalidates a card deletes it (see
+    db.set_metadata and db.apply_tag_mapping), so 'missing' is the only state to
+    repair — and repairing it is safe to retry, which a stale card would not be."""
+    rebuilt = 0
+    for row in db.rows_needing_card():
+        card = _card(row["title"], row["tags"], row["summary"])
+        db.replace_card_chunk(row["id"], _embed_texts([card])[0])
+        rebuilt += 1
+    return rebuilt
+
+
+def semantic_search(query: str, limit: int) -> list[dict]:
+    """Search by meaning: embed the query and let Postgres rank by cosine distance.
+
+    Ranking only needs relative order, so the stored vectors work as they are —
+    unlike clustering, which needs absolute distances and hence per-language
+    centering (see _center_by_language)."""
+    return db.semantic_search(_embed_texts([query])[0], limit, MIN_SIMILARITY)
 
 
 def _update_conversation_vector(row: dict, texts: list[str]) -> int:
@@ -128,8 +210,13 @@ class TagMergeMap(BaseModel):
 
 class ClusterAssignment(BaseModel):
     cluster_id: int
-    name: str = Field(min_length=1, max_length=60)
-    big_category: str = Field(min_length=1, max_length=60)
+    name: str = Field(min_length=1, max_length=60, description="the group's name only")
+    big_category: str = Field(
+        min_length=1,
+        max_length=60,
+        description="the big category's name only — never a sentence or a prefix such "
+        "as 'new category:'; use the exact existing name when it fits",
+    )
 
 
 class GroupNaming(BaseModel):
@@ -154,15 +241,34 @@ def _merge_agent() -> Agent:
     return Agent(GEN_MODEL, output_type=TagMergeMap, retries=2)
 
 
+# A label must be a name, not a sentence about the answer. Observed leak:
+# "새로운 대분류: 해외 생활과 법률 및 복지" — the model narrated that it was coining
+# a category and the narration became the category.
+_LABEL_NOISE = re.compile(
+    r"^\s*(new\s+(big\s+)?categor(y|ies)|새로운?\s*(대)?분류|신규\s*분류|category|대분류)\s*[:\-–]\s*",
+    re.IGNORECASE,
+)
+
+
+def _clean_label(label: str) -> str:
+    return _LABEL_NOISE.sub("", label).strip(" :-–\"'").strip()
+
+
 @cache
 def _naming_agent() -> Agent:
     agent = Agent(GEN_MODEL, output_type=GroupNaming, retries=2)
 
     @agent.output_validator
-    def check_language(ctx, output: GroupNaming) -> GroupNaming:
+    def check_labels(ctx, output: GroupNaming) -> GroupNaming:
         joined = " ".join(a.name + " " + a.big_category for a in output.assignments)
         if output.assignments and not _output_language_ok(joined):
             raise ModelRetry(f"Write group names in {ARCHIVE_LANGUAGE}.")
+        for a in output.assignments:
+            if _clean_label(a.name) != a.name or _clean_label(a.big_category) != a.big_category:
+                raise ModelRetry(
+                    "Give the bare name of each group and category. Do not prefix it with "
+                    "'new category:' or any other commentary."
+                )
         return output
 
     return agent
@@ -229,7 +335,11 @@ def _assign_and_name(
         return None
     changed_set = set(changed)
     return {
-        a.cluster_id: {"name": a.name[:40], "big": a.big_category[:40]}
+        a.cluster_id: {
+            # cleaned again here: the validator can exhaust its retries and still return
+            "name": _clean_label(a.name)[:40],
+            "big": _clean_label(a.big_category)[:40],
+        }
         for a in output.assignments
         if a.cluster_id in changed_set
     }
@@ -258,26 +368,18 @@ def _consolidate_tags() -> dict[str, str]:
 
 
 def _refresh_metadata(rows: list[dict]) -> set[int]:
-    """Regenerate title/tags/summary for conversations whose anchor is missing or
-    whose mean has drifted past the threshold. Returns the regenerated row ids."""
+    """Regenerate title/tags/summary for conversations flagged as drifted by
+    all_embedded (anchor missing, or moved past DRIFT_MIN_COS). Returns the
+    regenerated row ids."""
     regenerated: set[int] = set()
     for row in rows:
-        current = np.array(row["embedding"], dtype=np.float32)
-        anchor = row["tagged_embedding"]
-        if anchor is not None:
-            anchor_vec = np.array(anchor, dtype=np.float32)
-            cos = float(
-                current @ anchor_vec
-                / ((np.linalg.norm(current) * np.linalg.norm(anchor_vec)) + 1e-9)
-            )
-            if cos >= DRIFT_MIN_COS:
-                continue  # no meaningful movement since the anchor
+        if not row["drifted"]:
+            continue  # no meaningful movement since the anchor
         try:
             meta = _generate_metadata(db.messages_excerpt(row["id"]))
-            db.set_metadata(
-                row["id"], meta["title"], meta["tags"], meta["summary"],
-                [float(x) for x in current],
-            )
+            # drops the card too; _refresh_cards rebuilds it after the tag merge, so
+            # it is built from the final tags rather than the pre-merge spellings
+            db.set_metadata(row["id"], meta["title"], meta["tags"], meta["summary"])
             row["title"], row["tags"], row["summary"] = (
                 meta["title"], meta["tags"], meta["summary"],
             )
@@ -285,6 +387,14 @@ def _refresh_metadata(rows: list[dict]) -> set[int]:
         except Exception:
             continue  # failed rows are retried by the next refresh
     return regenerated
+
+
+def _load_matrix(rows: list[dict]) -> np.ndarray:
+    """Vectors for clustering and the projection, in `rows` order. Fetched here
+    instead of being carried inside `rows`, so the metadata phase — the slow part,
+    full of LLM calls — never holds them."""
+    vectors = db.embeddings_by_id()
+    return np.array([vectors[row["id"]] for row in rows], dtype=np.float32)
 
 
 def _center_by_language(matrix: np.ndarray, rows: list[dict]) -> np.ndarray:
@@ -376,10 +486,16 @@ def refresh() -> dict:
         ]
         embedded_count += _update_conversation_vector(row, texts)
 
-    rows = db.all_embedded()
+    # ahead of the drift gate on purpose: new messages must become searchable even
+    # when the conversation's overall subject hasn't moved. _refresh_cards also runs
+    # here so a card dropped by a run that failed later is repaired next time.
+    chunked_count = _refresh_body_chunks() + _refresh_cards()
+
+    rows = db.all_embedded(DRIFT_MIN_COS)
     if not rows:
         return {
             "embedded": embedded_count,
+            "chunks_indexed": chunked_count,
             "metadata_generated": 0,
             "tags_merged": 0,
             "total": 0,
@@ -392,6 +508,7 @@ def refresh() -> dict:
     if not regenerated:
         return {
             "embedded": embedded_count,
+            "chunks_indexed": chunked_count,
             "metadata_generated": 0,
             "tags_merged": 0,
             "total": len(rows),
@@ -411,7 +528,11 @@ def refresh() -> dict:
                     merged.append(canon)
             row["tags"] = merged
 
-    matrix = np.array([row["embedding"] for row in rows], dtype=np.float32)
+    # cards dropped by metadata regeneration and by the tag merge are rebuilt here,
+    # once both are settled, so each card matches the text finally stored
+    chunked_count += _refresh_cards()
+
+    matrix = _load_matrix(rows)
     matrix /= np.linalg.norm(matrix, axis=1, keepdims=True) + 1e-9
     matrix = _center_by_language(matrix, rows)
     small_clusters = _agglomerate(matrix, T_SMALL)
@@ -477,6 +598,7 @@ def refresh() -> dict:
 
     return {
         "embedded": embedded_count,
+        "chunks_indexed": chunked_count,
         "metadata_generated": len(regenerated),
         "tags_merged": len(mapping),
         "named": len(changed),
