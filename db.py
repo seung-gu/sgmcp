@@ -3,6 +3,7 @@
 import os
 
 import psycopg
+from psycopg import sql
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -36,6 +37,28 @@ _SCHEMA = [
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS embedded_vector_count INT NOT NULL DEFAULT 0",
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS tagged_embedding REAL[]",
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS source_url TEXT NOT NULL DEFAULT ''",
+    # Keyword search runs on word_similarity, not plain similarity: similarity()
+    # divides by the whole title's trigram count, so long titles score near zero
+    # (measured: only 2 of 1065 queries cleared the 0.3 default). word_similarity
+    # compares the query against the best-matching *part* of the title instead —
+    # same queries averaged 0.651. GIN trgm also lets the existing ILIKE use an index.
+    "CREATE EXTENSION IF NOT EXISTS pg_trgm",
+    """
+    CREATE INDEX IF NOT EXISTS conversations_title_trgm
+        ON conversations USING gin (title gin_trgm_ops)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS conversations_summary_trgm
+        ON conversations USING gin (summary gin_trgm_ops)
+    """,
+    # Body search is the expensive half — ILIKE over messages::text has to cast the
+    # whole JSONB per row. The expression index lets it use GIN instead; the planner
+    # ignores it while the table is small (46 rows, seq scan is cheaper) and picks it
+    # up as the archive grows. Costs ~7.6 MB against a 15 MB table.
+    """
+    CREATE INDEX IF NOT EXISTS conversations_messages_trgm
+        ON conversations USING gin ((messages::text) gin_trgm_ops)
+    """,
     # embedding_vec mirrors `embedding` in pgvector's own type so semantic search can
     # use the HNSW index; `embedding` stays the canonical column the pipeline reads.
     "CREATE EXTENSION IF NOT EXISTS vector",
@@ -218,18 +241,48 @@ def list_conversations(limit: int) -> list[dict]:
     return [_isoformat(row) for row in rows]
 
 
+# Below this the trigram score is noise rather than a weak match; measured against
+# 25 paraphrased queries with known answers.
+KEYWORD_MIN_SIMILARITY = 0.4
+
+
 def search_conversations(query: str, limit: int) -> list[dict]:
+    """Keyword search ranked by relevance rather than recency.
+
+    Substring hits (ILIKE) still win outright — an exact model name or typo-free
+    term should not be outranked by a fuzzy title match. Trigram similarity only
+    orders what is left, and catches inflected forms ("임베딩을") and misspellings
+    that ILIKE misses entirely."""
     pattern = f"%{query}%"
     with _connect() as conn:
+        # `<%` reads its cutoff from this GUC; the function form word_similarity()
+        # cannot use the GIN index at all, so the operator is not optional here.
+        conn.execute(
+            sql.SQL("SET LOCAL pg_trgm.word_similarity_threshold = {}").format(
+                sql.Literal(KEYWORD_MIN_SIMILARITY)
+            )
+        )
         rows = conn.execute(
             f"""
             SELECT {_LIST_COLUMNS}
             FROM conversations
-            WHERE title ILIKE %s OR summary ILIKE %s OR messages::text ILIKE %s
-            ORDER BY updated_at DESC
-            LIMIT %s
+            WHERE title ILIKE %(pat)s
+               OR summary ILIKE %(pat)s
+               OR messages::text ILIKE %(pat)s
+               OR %(q)s <%% title
+               OR %(q)s <%% summary
+            ORDER BY
+                (title ILIKE %(pat)s OR summary ILIKE %(pat)s) DESC,
+                greatest(word_similarity(%(q)s, title),
+                         word_similarity(%(q)s, summary)) DESC,
+                updated_at DESC
+            LIMIT %(limit)s
             """,
-            (pattern, pattern, pattern, limit),
+            {
+                "pat": pattern,
+                "q": query,
+                "limit": limit,
+            },
         ).fetchall()
     return [_isoformat(row) for row in rows]
 

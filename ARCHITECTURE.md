@@ -112,9 +112,24 @@ assistant message from each (max 40 messages, 400 chars each).
 
 ## Search
 
-Two modes share one box. **Text** is literal (`ILIKE` over title, summary and raw
-messages) — right for an exact string like an error message. **Meaning** embeds the
-query and ranks by cosine distance, served by an HNSW index in pgvector.
+Two modes share one box. **Text** matches literally (`ILIKE` over title, summary and
+raw messages) and then ranks what is left by trigram `word_similarity` — right for an
+exact string like an error message, a model name, or a query with a typo. **Meaning**
+embeds the query and ranks by cosine distance, served by an HNSW index in pgvector.
+
+Text search uses the `<%` operator, not `word_similarity(...) >= x`: only the operator
+form can use the GIN trigram index, the function form always falls back to a scan (same
+shape as `@>` vs `->>` for jsonb). Its cutoff comes from `pg_trgm.word_similarity_threshold`,
+set per transaction. The ranking clause still calls the function — that runs on the rows
+already selected, where no index applies.
+
+Text search uses `word_similarity`, not `similarity`. `similarity()` divides by the
+whole title's trigram count, so long titles score near zero — only 2 of 1065 measured
+queries cleared the 0.3 default. `word_similarity` compares the query against the
+best-matching *part* of the title instead: same queries averaged 0.651. Substring hits
+still sort first so an exact term is never outranked by a fuzzy one; the trigram score
+only orders the remainder and catches inflected forms (`임베딩을`) and misspellings
+(`pgvecter`) that `ILIKE` misses outright.
 
 Meaning-search deliberately does *not* use the conversation's average vector. An
 average answers "what is this conversation about overall", which is what clustering
@@ -167,6 +182,10 @@ projection.
 | small-cluster threshold 0.35 | placed in the measured valley of the centered similarity distribution |
 | `ARCHIVE_LANGUAGE` | all derived text in one configured language — keeps the tag vocabulary from splitting per language; enforced by an output validator with retry |
 | search passages of 1500 chars | 66 queries with known answers, top-1: conversation average 48%, per-message 59%, passages **68%** (live re-check 70%). Single messages lack context, whole conversations blur together. Passages also cost a fifth of per-message storage — 24 MB vs ~65 MB for this archive |
+| `word_similarity` over `similarity` | 1065 keyword queries against known titles: `similarity` averaged 0.084 and only **2** cleared its 0.3 default; `word_similarity` averaged **0.651**. `similarity` divides by the whole title, so long titles score near zero |
+| keyword floor 0.4 | below this the trigram score was noise rather than a weak match, measured on 25 paraphrased queries |
+| `pg_trgm` over `pg_search` (BM25) | benchmarked locally on a copy of this archive. Exact-word queries (40, with particles): trigram and BM25+ngram both MRR **1.000**; BM25+korean_lindera 0.950. Paraphrased queries (25): BM25+lindera led on MRR (0.670 vs trigram 0.599) but trigram+vector RRF led on R@5 (**84%** vs 80%). `korean_lindera` also drops unknown loanwords to single characters (`임베딩` → 임/베/딩) and pg_search exposes no user-dictionary option, so its edge shrinks as new technical terms arrive. Not worth self-hosting Postgres — Neon deprecated `pg_search` |
+| RRF only helps paraphrases | fusing keyword with vector raised R@5 from 76% to 84% on paraphrased queries, but *lowered* MRR from 1.000 to 0.715 on exact-word ones — the vector list drags in near-misses that push an exact hit down. Hence substring matches sort ahead of any score |
 
 ## Operations
 
@@ -192,3 +211,32 @@ projection.
   sibling conversation on the same topic rather than something unrelated
 - `embedding_vec` is kept in sync but nothing reads it yet — it is the column a
   "conversations similar to this one" feature would use
+- **Text search still needs `ILIKE` alongside the trigram operator, and that keeps the
+  query on a seq scan.** `<%` only covers `title` and `summary` — body text is too long
+  for word-similarity to mean anything — so `messages::text ILIKE` has to stay, and a
+  single non-indexable branch in an `OR` chain drops the whole query to a scan
+  (measured: 66 ms over 46 rows, `Seq Scan`, all three trigram indexes ignored). The
+  expression index on `messages::text` does work when forced (`enable_seqscan=off` →
+  `Bitmap Heap Scan`); the planner just prefers a scan at this size. Whether it flips
+  on its own as the archive grows is untested.
+
+  **What `pg_search` would buy** — not better results, but a simpler shape. Measured
+  quality was a wash (see the evidence table): identical MRR on exact-word queries,
+  trigram+vector RRF actually ahead on paraphrases. The gain is structural:
+
+  | | now | with BM25 |
+  |---|---|---|
+  | where clause | 5 branches (3 ILIKE + 2 `<%`) | 1 (`@@@`) |
+  | order by | 3 tiers, hand-tuned | `paradedb.score()` |
+  | indexes for text | 3 trigram GIN | 1 BM25 |
+  | body search | ILIKE only, forces seq scan | same index as title |
+  | index actually used | no, at this size | yes |
+  | field weighting, phrase search | none | built in |
+
+  Blocked by Neon (`neon.deprecated_extensions = pg_search, plv8`), so it means either
+  ParadeDB Cloud or self-hosting Postgres — backups, failover and upgrades become ours.
+  At 46 conversations / 15 MB that trade is not worth it. **Revisit when text search is
+  a primary path rather than a fallback, or when the seq scan shows up in practice.**
+  The benchmark is reproducible: `docker run paradedb/paradedb`, `pg_dump -t conversations`,
+  then the two eval sets (40 title-word queries with particles, 25 paraphrases with known
+  answers) scored by MRR and R@5.
