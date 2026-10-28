@@ -2,6 +2,7 @@
 # generation, tag consolidation, clustering, and group naming.
 # Also hosts semantic search, which shares the embedding call.
 
+import bisect
 import json
 import logging
 import os
@@ -41,12 +42,27 @@ T_SMALL = 0.30
 MIN_CHARS = 30  # messages shorter than this ("thanks", "ok") don't vote in the mean
 MIN_GROUP_FOR_CENTERING = 4  # smaller language groups fall back to the global mean
 
-# Consecutive messages are glued into passages of about this many characters before
-# being embedded for search. Measured 2026-07-15 over 66 queries with known answers:
+# Conversations are cut into passages of this many characters before being embedded
+# for search. Measured 2026-07-15 (with passages of about this size) over 66 queries:
 # whole-conversation average 48% top-1, per-message 59%, these passages 68% — single
 # messages are too short to carry context, whole conversations too blurred. Passages
 # also cost a fifth of per-message storage (13 MB vs 65 MB here).
 CHUNK_CHARS = 1500
+
+# Each passage is embedded together with the last this-many characters before it, so
+# a sentence or a question/answer pair straddling a cut still scores as a whole.
+# Positions are unaffected: they cover the messages of the passage's own text only.
+CHUNK_OVERLAP = 200
+# A cut moves back to the last space or newline within this many characters, so
+# words stay whole; with none in reach it falls exactly on CHUNK_CHARS.
+CUT_SNAP = 100
+
+# Bump whenever the passage rule changes. A conversation indexed under another
+# version is re-cut from scratch on its next indexing (save or refresh), so old and
+# new passages never mix inside one conversation.
+# 1: whole messages glued past CHUNK_CHARS, 6,000-character cap (dropped 11% of text)
+# 2: hard cut every CHUNK_CHARS with CHUNK_OVERLAP
+CHUNK_VERSION = 2
 
 # Meaning-search floor. Measured 2026-07-29 over the same 66 queries: right answers
 # scored a median 0.486 (lowest 0.274), everything else a median 0.285. Cutting here
@@ -85,23 +101,42 @@ def _embed_texts(texts: list[str]) -> list[list[float]]:
 
 
 def _passages(messages: list[dict]) -> list[tuple[int, int, str]]:
-    """Glue consecutive messages into ~CHUNK_CHARS passages, skipping the short
+    """Cut a conversation into passages of CHUNK_CHARS characters, skipping the short
     chatter that MIN_CHARS already excludes from the mean. Each passage comes as
-    (first message index, last message index, text)."""
-    passages, buf, first, last = [], "", 0, 0
+    (first message index, last message index, text to embed): the indexes cover the
+    messages its own characters come from, and the text also starts with the
+    CHUNK_OVERLAP characters before it.
+
+    The cut ignores message boundaries, so sizes stay even and a long message is
+    split rather than truncated; the overlap is what keeps a sentence or a
+    question/answer pair that straddles a cut together. Every cut depends only on
+    the text before it, so appending messages changes the last passage alone."""
+    owners, starts, parts, offset = [], [], [], 0
     for i, message in enumerate(messages):
         content = (message.get("content") or "").strip()
         if len(content) < MIN_CHARS:
             continue
-        if not buf:
-            first = i
-        buf += content[:6000] + "\n"
-        last = i
-        if len(buf) >= CHUNK_CHARS:
-            passages.append((first, last, buf[:6000]))
-            buf = ""
-    if buf.strip():
-        passages.append((first, last, buf[:6000]))
+        owners.append(i)
+        starts.append(offset)
+        parts.append(content)
+        offset += len(content) + 1  # the newline joining it to the next one
+    stream = "\n".join(parts)
+
+    def owner(at: int) -> int:
+        return owners[bisect.bisect_right(starts, at) - 1]
+
+    passages, start = [], 0
+    while start < len(stream):
+        end = start + CHUNK_CHARS
+        if end < len(stream):
+            space = max(stream.rfind(" ", end - CUT_SNAP, end), stream.rfind("\n", end - CUT_SNAP, end))
+            if space > start:
+                end = space + 1
+        else:
+            end = len(stream)
+        text = stream[max(start - CHUNK_OVERLAP, 0) : end]
+        passages.append((owner(start), owner(end - 1), text))
+        start = end
     return passages
 
 
@@ -119,13 +154,20 @@ def _index_body_chunks(row: dict) -> int:
     db.save_conversation applies to the mean vector."""
     messages = row["messages"]
     rewritten = len(messages) < row["chunked_message_count"]
-    start = 0 if rewritten else max(row["body_chunks"] - 1, 0)
+    recut = row["chunk_version"] != CHUNK_VERSION
+    start = 0 if rewritten or recut else max(row["body_chunks"] - 1, 0)
     passages = _passages(messages)
     texts = [text for _, _, text in passages[start:]]
     vectors = _embed_texts(texts) if texts else []
     positions = [(first, last) for first, last, _ in passages]
     db.replace_body_chunks(
-        row["id"], start, vectors, positions, len(messages), row["chunked_message_count"]
+        row["id"],
+        start,
+        vectors,
+        positions,
+        len(messages),
+        row["chunked_message_count"],
+        CHUNK_VERSION,
     )
     return len(vectors)
 
@@ -145,7 +187,7 @@ def index_soon(key: str) -> None:
 
 def _index_conversation(key: str) -> None:
     try:
-        for row in db.rows_needing_chunks(key):
+        for row in db.rows_needing_chunks(CHUNK_VERSION, key):
             _index_body_chunks(row)
     except Exception:
         logging.getLogger(__name__).exception("indexing %s failed; the next save retries", key)
@@ -154,7 +196,7 @@ def _index_conversation(key: str) -> None:
 def _refresh_body_chunks() -> int:
     """Index search passages for every conversation that gained messages. The counter
     starts at zero, so the first run indexes the whole archive."""
-    return sum(_index_body_chunks(row) for row in db.rows_needing_chunks())
+    return sum(_index_body_chunks(row) for row in db.rows_needing_chunks(CHUNK_VERSION))
 
 
 def _refresh_cards() -> int:

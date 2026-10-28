@@ -67,6 +67,8 @@ _SCHEMA = [
     # until their conversation is indexed again.
     "ALTER TABLE conversation_chunks ADD COLUMN IF NOT EXISTS first_message INT",
     "ALTER TABLE conversation_chunks ADD COLUMN IF NOT EXISTS last_message INT",
+    # Which passage rule (grouping.CHUNK_VERSION) a conversation's passages were cut by.
+    "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS chunk_version INT NOT NULL DEFAULT 1",
     # What assistants searched for and which messages they then read — the only way
     # to see whether they follow a search hit through or stop at the first window.
     """
@@ -476,25 +478,27 @@ def embeddings_by_id() -> dict[int, list[float]]:
         }
 
 
-def rows_needing_chunks(key: str | None = None) -> list[dict]:
-    """Conversations whose search passages are missing, behind the message list, or
-    still without positions, with how far each was indexed — enough to embed only
-    what changed. Pass `key` to check a single conversation."""
+def rows_needing_chunks(version: int, key: str | None = None) -> list[dict]:
+    """Conversations whose search passages are missing, behind the message list, cut
+    by another rule than `version`, or still without positions — with how far each
+    was indexed, enough to embed only what changed. Pass `key` to check a single
+    conversation."""
     with _connect() as conn:
         return conn.execute(
             """
-            SELECT id, messages, chunked_message_count,
+            SELECT id, messages, chunked_message_count, chunk_version,
                    (SELECT count(*) FROM conversation_chunks
                     WHERE conversation_id = conversations.id AND kind = 'body') AS body_chunks
             FROM conversations
             WHERE (chunked_message_count <> jsonb_array_length(messages)
+                   OR chunk_version <> %(version)s
                    OR EXISTS (SELECT 1 FROM conversation_chunks
                               WHERE conversation_id = conversations.id AND kind = 'body'
                                 AND first_message IS NULL))
               AND (%(key)s::text IS NULL OR conversation_key = %(key)s)
             ORDER BY id
             """,
-            {"key": key},
+            {"key": key, "version": version},
         ).fetchall()
 
 
@@ -523,6 +527,7 @@ def replace_body_chunks(
     positions: list[tuple[int, int]],
     message_count: int,
     indexed_count: int,
+    version: int,
 ) -> bool:
     """Swap in body passages from chunk `start` on, keeping the ones before it.
     `positions` holds every passage's (first, last) message, so kept passages that
@@ -565,8 +570,9 @@ def replace_body_chunks(
             (list(range(len(kept))), [f for f, _ in kept], [l for _, l in kept], row_id),
         )
         conn.execute(
-            "UPDATE conversations SET chunked_message_count = %s WHERE id = %s",
-            (message_count, row_id),
+            "UPDATE conversations SET chunked_message_count = %s, chunk_version = %s"
+            " WHERE id = %s",
+            (message_count, version, row_id),
         )
     return True
 

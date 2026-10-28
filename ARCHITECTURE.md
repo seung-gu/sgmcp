@@ -135,11 +135,23 @@ the conversation on a single background worker, so a save never waits on OpenAI 
 saves never index the same conversation twice at once. Passages are cut in message
 order, so appended messages can only change the last passage and add new ones; only
 those are embedded — one passage per turn, where rebuilding the largest conversation
-from scratch takes 606. Embedding runs outside any lock, so before writing, the job
+from scratch takes about a thousand. Embedding runs outside any lock, so before writing, the job
 locks the row and checks that `chunked_message_count` is still the value it started
 from; if a refresh got there first, it writes nothing. A failed run leaves the counter
 behind, so the next save or the refresh's catch-up step finishes the job. A
 conversation that shrank was rewritten, and starts over.
+
+Passages are a hard cut every 1,500 characters of the conversation's text (moved
+back to a space within 100 characters, so words stay whole), not aligned to
+messages: sizes stay even and a long message is split rather than truncated. The
+earlier message-aligned rule glued whole messages past 1,500 characters and capped a
+passage at 6,000, which left 11% of the text unsearchable. Each passage is embedded
+together with the 200 characters before it, while its positions still cover only the
+messages of its own text: a sentence or a question/answer pair straddling a cut then
+scores as a whole instead of as two weak halves. The cutting rule carries a version (`CHUNK_VERSION`, stored per
+conversation as `chunk_version`); a conversation cut under another version is re-cut
+from scratch on its next indexing, so old and new passages never mix — changing the
+rule means bumping the number, and a save or refresh does the rest.
 
 Cards follow a delete-and-rebuild rule: anything that changes their input text
 (metadata regeneration, the tag merge) deletes the card row in the same transaction,
@@ -168,7 +180,7 @@ or stop at the first window.
 | Canonical (immutable) | `conversation_key` `messages` `source` `project` | clients |
 | Derived — LLM | `title` `tags` (importance-ordered array) `summary` `tagged_embedding` (anchor) | refresh, drift-gated |
 | Derived — math | `embedding` (weighted mean) `embedding_vec` (same, pgvector-typed) `embedded_*_count` `cluster_small/big(_label)` `px py pz` | refresh |
-| Search index | `conversation_chunks(conversation_id, kind, chunk_index, vec, first_message, last_message)` + `chunked_message_count` | each save (body passages, background) · refresh (cards, catch-up) |
+| Search index | `conversation_chunks(conversation_id, kind, chunk_index, vec, first_message, last_message)` + `chunked_message_count` `chunk_version` | each save (body passages, background) · refresh (cards, catch-up) |
 | Usage log | `recall_log(tool, args, result)` — a separate table | the MCP search and read tools |
 
 Drift is evaluated in SQL (`embedding <=> tagged_embedding`), so the metadata phase

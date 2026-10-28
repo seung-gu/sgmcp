@@ -41,10 +41,11 @@ the archive and see the groups on a 3D map.
   tags and summaries from the LLM; with no drift, a refresh makes no LLM calls.
   Clustering then groups conversations by topic, and PCA places them on the 3D map.
 - **Searching.** Text search matches exact strings, such as an error message. Meaning
-  search cuts each conversation into ~1,500-character passages and ranks a
-  conversation by its best-matching passage. The server indexes new messages in the
-  background right after each save; passages are cut in message order, so only the
-  last passage and any new ones are embedded.
+  search cuts each conversation's text every 1,500 characters, embeds each passage
+  with the 200 characters before it, and ranks a conversation by its best-matching
+  passage. The server indexes new messages in the background right after each save;
+  passages are cut in text order, so only the last passage and any new ones are
+  embedded.
 
 [ARCHITECTURE.md](ARCHITECTURE.md) has the diagrams, the data model and the
 measurements behind each tuned value.
