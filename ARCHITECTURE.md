@@ -95,24 +95,24 @@ sequenceDiagram
 
 Apart from search passages, which every save indexes on its own (see Search), the
 dashboard button is the only derivation trigger. 🤖 marks
-an LLM call — with N drifted conversations a refresh makes **N + 2** calls, with
-zero drift it makes **none**.
+an LLM call — with N drifted conversations a refresh makes **N + 3** calls (N
+metadata, one tag merge, two to name the tree); with zero drift and the same clusters
+as last time it makes **none**.
 
 ```mermaid
 flowchart TD
     S([Refresh groups]) --> C["catch up search passages still behind<br/>(saves index their own; this repairs failed runs · ahead of the gate)"]
     C --> E["mean vector = the passages' average, weighted by own length<br/>no embedding calls · skips conversations whose passages didn't move"]
     E --> G{"drift check<br/>no anchor, or cosine below 0.99"}
-    G -- "none" --> X(["done — groups, names, coordinates all kept<br/>zero LLM calls"])
     G -- "one or more" --> M["🤖 regenerate drifted conversations only<br/>sample of 40 → title · tags (importance-ordered) · summary<br/>anchor moves to the current vector · stale search card dropped"]
     M --> T["🤖 tag merge — one global call<br/>unify same topic, different spellings<br/>retagged conversations drop their card too"]
     T --> RC["rebuild every missing search card<br/>(now that title and tags are final)"]
-    RC --> K["small clusters (geometry)<br/>per-language centering · cosine 0.35"]
-    K --> CH{"per cluster:<br/>same members as last time,<br/>none regenerated?"}
-    CH -- "kept" --> KEEP["name and big category unchanged<br/>(appears only in the candidate roster)"]
-    CH -- "changed" --> N["🤖 name and assign — one global call<br/>changed clusters' raw tags + roster (names, top tags)<br/>fallback: most-common tag, own category"]
-    KEEP --> P["3D coordinates (PCA) → store everything"]
-    N --> P
+    RC --> K
+    G -- "none" --> K["small clusters (geometry, every refresh)<br/>passage mean + card · per-language centering<br/>average linkage · cosine 0.28"]
+    K --> CH{"anything drifted, or clusters<br/>differ from the stored ones?"}
+    CH -- "no" --> X(["done — groups, names, coordinates all kept<br/>zero LLM calls"])
+    CH -- "yes" --> N["🤖 name the whole tree — gpt-5.4-mini, two calls<br/>① invent 5–10 big categories, each with what it holds<br/>② place every group into one (closed choice) and name it<br/>failure stores nothing, so the next refresh retries"]
+    N --> P["3D coordinates (PCA) → store everything"]
 ```
 
 Sample = split the conversation into 20 segments, take the longest user and
@@ -219,7 +219,8 @@ projection.
 | length-weighted mean | equal weighting over-represents short frequent messages — real case: meta remarks were 37% of characters but took 53% of the vote and misplaced a conversation |
 | per-language centering | before: similarity median 0.714 (one blob). After: same topic 0.4–0.9, different topics negative |
 | big categories = LLM | "object detection and multi-agent are both AI" is classification knowledge, not geometry — the geometric version failed with 7 near-singletons |
-| small-cluster threshold 0.35 | placed in the measured valley of the centered similarity distribution |
+| small clusters: average linkage on mean + card, 0.28 | 87 conversations scored against the pairs two LLM filings agreed on (155 together, the rest apart): F1 0.62, precision 0.78, flat at 0.58–0.62 from 0.22 to 0.32. The previous centroid linkage on the mean alone scored 0.37 — a growing cluster's blurred centre absorbed its neighbours into a 16-member blob |
+| tree named in two calls, `gpt-5.4-mini` | one call inventing categories and assigning groups at once filed software projects under job hunting. Two calls (categories with scopes, then a closed choice) on 36 groups misfiled ~6 with 4.1-mini, ~5 with 5.4-mini, ~3 with 5.5, at $0.01 / $0.02 / $0.18 a regroup |
 | `ARCHIVE_LANGUAGE` | all derived text in one configured language — keeps the tag vocabulary from splitting per language; enforced by an output validator with retry |
 | search passages of 1500 chars | 66 queries with known answers, top-1: conversation average 48%, per-message 59%, passages **68%** (live re-check 70%). Single messages lack context, whole conversations blur together. Passages also cost a fifth of per-message storage — 24 MB vs ~65 MB for this archive |
 
@@ -229,8 +230,6 @@ projection.
   local `.env`: `INGEST_TOKEN` (for the hook)
 - **Deploy**: `fly deploy --ha=false` — schema migrates automatically at startup
 - **Cost**: Fly under $2 (suspend) + Neon $0 + OpenAI a few dozen cents per month
-- **Full big-category rebuild** (one-off, when the structure grows stale):
-  `UPDATE conversations SET cluster_small = NULL`, then refresh
 
 ## Known limitations / open items
 

@@ -40,8 +40,10 @@ the archive and see the groups on a 3D map.
 - **Deriving.** The dashboard's "Refresh groups" button averages each conversation's
   search passages into one vector (weighted by length, no new embedding calls) and
   checks which conversations have drifted from their last summary. Only those get new titles,
-  tags and summaries from the LLM; with no drift, a refresh makes no LLM calls.
-  Clustering then groups conversations by topic, and PCA places them on the 3D map.
+  tags and summaries from the LLM. Clustering then groups conversations by topic, an
+  LLM names the groups and shelves them under big categories it chooses, and PCA
+  places them on the 3D map. With no drift and the same groups as before, a refresh
+  makes no LLM calls.
 - **Searching.** Text search matches exact strings, such as an error message. Meaning
   search cuts each conversation's text every 1,500 characters, embeds each passage
   with the 200 characters before it, and ranks a conversation by its best-matching
@@ -69,9 +71,9 @@ measurements behind each tuned value.
   connect to it as a remote MCP server
 - **Database**: Neon Postgres with pgvector, one store for the text, the vectors and
   the HNSW index behind meaning search
-- **LLM**: OpenAI `text-embedding-3-small` for embeddings; `gpt-4.1-mini` through
-  pydantic-ai for titles, tags and group names, with schema and language checks that
-  retry on failure
+- **LLM**: OpenAI `text-embedding-3-small` for embeddings; through pydantic-ai,
+  `gpt-4.1-mini` for titles, tags and summaries and `gpt-5.4-mini` for the group
+  tree, with schema and language checks that retry on failure
 - **Dashboard**: a single HTML page, with Plotly for the 3D map
 - **Hosting**: Fly.io in Frankfurt, suspended when idle. Running costs: Fly under $2,
   Neon $0 and OpenAI a few dozen cents a month

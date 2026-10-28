@@ -654,6 +654,19 @@ def embeddings_by_id() -> dict[int, list[float]]:
         }
 
 
+def card_vectors_by_id() -> dict[int, list[float]]:
+    """Every conversation's card vector (title + tags + summary), keyed by row id —
+    blended with the mean for clustering and the 3D projection."""
+    with _connect() as conn:
+        return {
+            row["conversation_id"]: json.loads(row["vec"])
+            for row in conn.execute(
+                "SELECT conversation_id, vec::text AS vec FROM conversation_chunks"
+                " WHERE kind = 'card'"
+            ).fetchall()
+        }
+
+
 def rows_needing_chunks(version: int, key: str | None = None) -> list[dict]:
     """Conversations whose search passages are missing, behind the message list, cut
     by another rule than `version`, or still without positions — with how far each
