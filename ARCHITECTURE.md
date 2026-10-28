@@ -164,10 +164,10 @@ message it covers, so a meaning-search result groups its best passages (within 0
 of its best score, at most 10 passages apart) into `sections`: message ranges with
 the best message and an excerpt. Keyword results do the same with the messages that
 contain the word (hits at most 20 messages apart form a section; newest first, older
-ones still listed). `get_conversation` then reads `count` messages from `start`,
-sliced in the database. A page stops at 20,000 characters, inside Claude Code's
-tool-output limit (a single longer message is cut and flagged `truncated`), and a
-conversation under that size comes back whole. A
+ones still listed). `get_conversation` then reads one page from `start`, or backwards
+from the newest message: the database adds messages until their text reaches 20,000
+characters, inside Claude Code's tool-output limit, so a conversation under that size
+comes back whole (a single longer message is cut and flagged `truncated`). A
 section's length is what tells an assistant whether the topic was a passing remark
 or a long discussion worth paging through. Every search and read made through MCP
 lands in `recall_log`, the way to check whether assistants follow a section through

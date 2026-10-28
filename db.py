@@ -37,8 +37,9 @@ _SCHEMA = [
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS embedded_vector_count INT NOT NULL DEFAULT 0",
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS tagged_embedding REAL[]",
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS source_url TEXT NOT NULL DEFAULT ''",
-    # embedding_vec mirrors `embedding` in pgvector's own type so semantic search can
-    # use the HNSW index; `embedding` stays the canonical column the pipeline reads.
+    # embedding_vec mirrors `embedding` in pgvector's own type, with an HNSW index, for
+    # "conversations similar to this one" (Future Ideas). Nothing reads it yet — meaning
+    # search runs on conversation_chunks. `embedding` stays the column the pipeline reads.
     "CREATE EXTENSION IF NOT EXISTS vector",
     f"ALTER TABLE conversations ADD COLUMN IF NOT EXISTS embedding_vec vector({EMBED_DIMENSIONS})",
     """
@@ -68,6 +69,12 @@ _SCHEMA = [
     # until their conversation is indexed again.
     "ALTER TABLE conversation_chunks ADD COLUMN IF NOT EXISTS first_message INT",
     "ALTER TABLE conversation_chunks ADD COLUMN IF NOT EXISTS last_message INT",
+    # Trigram indexes let keyword search's ILIKE '%…%' on title and summary skip a full
+    # scan. They existed only in the database (from the trigram experiments); declaring
+    # them here keeps a fresh database the same.
+    "CREATE EXTENSION IF NOT EXISTS pg_trgm",
+    "CREATE INDEX IF NOT EXISTS conversations_title_trgm ON conversations USING gin (title gin_trgm_ops)",
+    "CREATE INDEX IF NOT EXISTS conversations_summary_trgm ON conversations USING gin (summary gin_trgm_ops)",
     # Which passage rule (grouping.CHUNK_VERSION) a conversation's passages were cut by.
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS chunk_version INT NOT NULL DEFAULT 1",
     # One row per message, replacing the `messages` array: appending a turn writes a
@@ -353,34 +360,40 @@ def list_conversations(limit: int) -> list[dict]:
 
 
 def conversation_overview(key: str) -> dict | None:
-    """Everything about one conversation except its messages, plus their count and
-    total size — enough to decide how many messages to send before fetching any."""
+    """Everything about one conversation except its messages, plus their count."""
     with _connect() as conn:
         row = conn.execute(
-            f"""
-            SELECT {_LIST_COLUMNS},
-                   (SELECT coalesce(sum(char_length(content)), 0) FROM messages
-                    WHERE conversation_id = conversations.id) AS chars
-            FROM conversations
-            WHERE conversation_key = %s
-            """,
-            (key,),
+            f"SELECT {_LIST_COLUMNS} FROM conversations WHERE conversation_key = %s", (key,)
         ).fetchone()
     return _isoformat(row) if row else None
 
 
-def conversation_messages(key: str, start: int, stop: int) -> list[dict]:
-    """messages[start:stop], read by index range so a long conversation never travels
-    whole."""
+def conversation_page(
+    key: str, budget: int, start: int | None = None, count: int | None = None
+) -> list[dict]:
+    """One page of a conversation, cut in the database so a long one never travels
+    whole: from `start` forward, or backwards from the newest message when `start` is
+    None, until the messages, measured as the JSON they are sent as (field names,
+    escapes and all), reach `budget` characters or number `count`. The first message
+    always comes, even when it alone is over budget. Rows are in order and carry
+    their `idx`."""
+    order = "ASC" if start is not None else "DESC"
     with _connect() as conn:
         rows = conn.execute(
-            """
-            SELECT m.role, m.content, m.at
-            FROM messages m JOIN conversations c ON c.id = m.conversation_id
-            WHERE c.conversation_key = %s AND m.idx >= %s AND m.idx < %s
-            ORDER BY m.idx
+            f"""
+            SELECT idx, role, content, at FROM (
+                SELECT m.idx, m.role, m.content, m.at,
+                       sum(char_length(jsonb_build_object(
+                           'role', m.role, 'content', m.content, 'at', m.at)::text)) OVER w AS used,
+                       row_number() OVER w AS n
+                FROM messages m JOIN conversations c ON c.id = m.conversation_id
+                WHERE c.conversation_key = %(key)s AND m.idx >= %(start)s
+                WINDOW w AS (ORDER BY m.idx {order})
+            ) page
+            WHERE (used <= %(budget)s OR n = 1) AND (%(count)s::int IS NULL OR n <= %(count)s)
+            ORDER BY idx
             """,
-            (key, start, stop),
+            {"key": key, "start": start or 0, "budget": budget, "count": count},
         ).fetchall()
     return [{**row, "at": _iso(row["at"])} for row in rows]
 

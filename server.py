@@ -1,6 +1,5 @@
 # sgmcp — personal conversation-archive MCP server
 
-import json
 import logging
 import os
 import uuid
@@ -121,51 +120,39 @@ def get_conversation(
         int | None,
         Field(
             description="index of the first message to return (0-based) — e.g. a few "
-            "messages before a search result's best_message. Omit for the most recent ones",
+            "messages before a search result's best_message. Omit to read backwards from "
+            "the most recent message",
             ge=0,
         ),
     ] = None,
     count: Annotated[
-        int,
-        Field(
-            description="how many messages to return; 0 means no count limit. Either way a "
-            "page stops at about 20,000 characters, so `showing` may cover fewer — continue "
-            "with `next_start`",
-            ge=0,
-        ),
-    ] = 20,
+        int | None,
+        Field(description="at most this many messages; omit to fill a page", ge=1),
+    ] = None,
 ) -> dict:
     """Loads one stored conversation. full=false gives the summary. full=true gives the
-    verbatim messages: a short conversation comes back whole, a long one returns `count`
-    messages from `start` (default: the most recent). `showing` is the range returned and
-    `message_count` the total; continue with `next_start` or `prev_start`. A single
-    message longer than a page comes back cut, marked `truncated`. Each message carries
-    `at`, when it was sent (null where the archive never learned it)."""
+    verbatim messages one page at a time — about 20,000 characters, from `start` forward
+    or, without `start`, the most recent ones — so a short conversation comes back whole.
+    `showing` is the range returned and `message_count` the total; continue with
+    `next_start` or `prev_start`. A single message longer than a page comes back cut,
+    marked `truncated`. Each message carries `at`, when it was sent (null where the
+    archive never learned it)."""
     conversation = db.conversation_overview(conversation_key)
     if conversation is None:
         raise ValueError(
             f"'{conversation_key}' not found. Check the key with list_conversations."
         )
     total = conversation["message_count"]
-    chars = conversation.pop("chars")
     if full or not conversation.get("summary"):
-        if count == 0 or (start is None and chars <= PAGE_CHARS):
-            lo, hi = min(start or 0, total), total
-        elif start is None:
-            lo, hi = max(total - count, 0), total
-        else:
-            lo, hi = min(start, total), min(start + count, total)
-        # the most recent messages are filled from the end, so the newest are never dropped
-        from_end = start is None and count != 0
-        messages = _fit(db.conversation_messages(conversation_key, lo, hi), from_end)
-        if from_end:
-            lo = hi - len(messages)
-        else:
-            hi = lo + len(messages)
-        conversation["messages"] = messages
-        conversation["showing"] = {"start": lo, "end": hi - 1} if hi > lo else None
+        page = db.conversation_page(conversation_key, PAGE_CHARS, start, count)
+        if len(page) == 1 and len(page[0]["content"]) > PAGE_CHARS:  # over budget only when alone
+            page[0] = {**page[0], "content": page[0]["content"][:PAGE_CHARS], "truncated": True}
+        lo = page[0]["idx"] if page else min(start or 0, total)
+        hi = page[-1]["idx"] + 1 if page else lo
+        conversation["messages"] = [{k: v for k, v in m.items() if k != "idx"} for m in page]
+        conversation["showing"] = {"start": lo, "end": hi - 1} if page else None
         conversation["next_start"] = hi if hi < total else None
-        conversation["prev_start"] = max(lo - (hi - lo), 0) if lo > 0 else None
+        conversation["prev_start"] = max(lo - max(hi - lo, 1), 0) if lo > 0 else None
     _log_recall(
         "get_conversation",
         {"conversation_key": conversation_key, "full": full, "start": start, "count": count},
@@ -237,22 +224,6 @@ def search_conversations_by_meaning(
         {"results": [_logged(r, ("similarity",)) for r in results]},
     )
     return results
-
-
-def _fit(messages: list[dict], from_end: bool) -> list[dict]:
-    """Keep as many messages as fit in PAGE_CHARS, counting from the start or the end.
-    A single message longer than the page is cut and flagged, so a page always makes
-    progress."""
-    kept, used = [], 0
-    for message in reversed(messages) if from_end else messages:
-        size = len(json.dumps(message, ensure_ascii=False))
-        if used + size > PAGE_CHARS:
-            if not kept:
-                kept.append({**message, "content": message["content"][:PAGE_CHARS], "truncated": True})
-            break
-        kept.append(message)
-        used += size
-    return kept[::-1] if from_end else kept
 
 
 def _logged(result: dict, fields: tuple[str, ...]) -> dict:
