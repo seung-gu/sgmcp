@@ -62,6 +62,22 @@ _SCHEMA = [
         ON conversation_chunks USING hnsw (vec vector_cosine_ops)
     """,
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS chunked_message_count INT NOT NULL DEFAULT 0",
+    # Where each body passage sits in its conversation, so a search hit can say which
+    # messages to read. NULL for cards, and for passages indexed before these existed
+    # until their conversation is indexed again.
+    "ALTER TABLE conversation_chunks ADD COLUMN IF NOT EXISTS first_message INT",
+    "ALTER TABLE conversation_chunks ADD COLUMN IF NOT EXISTS last_message INT",
+    # What assistants searched for and which messages they then read — the only way
+    # to see whether they follow a search hit through or stop at the first window.
+    """
+    CREATE TABLE IF NOT EXISTS recall_log (
+        id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+        at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        tool TEXT NOT NULL,
+        args JSONB NOT NULL,
+        result JSONB NOT NULL
+    )
+    """,
 ]
 
 # Ask the model to request the conversation URL when it's still missing and the
@@ -218,7 +234,89 @@ def list_conversations(limit: int) -> list[dict]:
     return [_isoformat(row) for row in rows]
 
 
+def conversation_overview(key: str) -> dict | None:
+    """Everything about one conversation except its messages, plus their count and
+    total size — enough to decide how many messages to send before fetching any."""
+    with _connect() as conn:
+        row = conn.execute(
+            f"""
+            SELECT {_LIST_COLUMNS}, char_length(messages::text) AS chars
+            FROM conversations
+            WHERE conversation_key = %s
+            """,
+            (key,),
+        ).fetchone()
+    return _isoformat(row) if row else None
+
+
+def conversation_messages(key: str, start: int, stop: int) -> list[dict]:
+    """messages[start:stop], sliced in the database so a long conversation never
+    travels whole."""
+    with _connect() as conn:
+        return conn.execute(
+            """
+            SELECT coalesce(jsonb_agg(t.m ORDER BY t.i), '[]'::jsonb) AS messages
+            FROM conversations c, jsonb_array_elements(c.messages) WITH ORDINALITY t(m, i)
+            WHERE c.conversation_key = %s AND t.i > %s AND t.i <= %s
+            """,
+            (key, start, stop),
+        ).fetchone()["messages"]
+
+
+def log_recall(tool: str, args: dict, result: dict) -> None:
+    with _connect() as conn:
+        conn.execute(
+            "INSERT INTO recall_log (tool, args, result) VALUES (%s, %s, %s)",
+            (tool, Jsonb(args), Jsonb(result)),
+        )
+
+
+def messages_at(spots: list[tuple[str, int]]) -> dict[tuple[str, int], str]:
+    """The text of selected messages, as (conversation_key, index) -> content."""
+    if not spots:
+        return {}
+    with _connect() as conn:
+        rows = conn.execute(
+            """
+            SELECT s.key, s.idx, c.messages -> s.idx ->> 'content' AS content
+            FROM unnest(%s::text[], %s::int[]) AS s(key, idx)
+            JOIN conversations c ON c.conversation_key = s.key
+            """,
+            ([key for key, _ in spots], [idx for _, idx in spots]),
+        ).fetchall()
+    return {(r["key"], r["idx"]): r["content"] or "" for r in rows}
+
+
+# Keyword hits at most this many messages apart belong to one section.
+KEYWORD_SECTION_GAP = 20
+EXCERPT_CHARS = 200
+EXCERPTED_SECTIONS = 3  # only the newest few sections carry an excerpt, to keep results light
+
+
+def _keyword_sections(positions: list[int]) -> list[dict]:
+    """Group the messages containing a keyword into sections, newest first."""
+    groups = [[positions[0]]]
+    for p in positions[1:]:
+        if p - groups[-1][-1] <= KEYWORD_SECTION_GAP:
+            groups[-1].append(p)
+        else:
+            groups.append([p])
+    return [
+        {"start": g[0], "end": g[-1], "length": g[-1] - g[0] + 1, "hits": len(g), "best_message": g[-1]}
+        for g in reversed(groups)
+    ]
+
+
+def _around(text: str, query: str) -> str:
+    at = max(text.lower().find(query.lower()), 0)
+    start = max(at - EXCERPT_CHARS // 3, 0)
+    return text[start : start + EXCERPT_CHARS]
+
+
 def search_conversations(query: str, limit: int) -> list[dict]:
+    """Keyword search, most recently updated first. Each result also says where in
+    the conversation the keyword occurs: every message containing it, grouped into
+    sections, so an older stretch is listed even when a newer one exists."""
     pattern = f"%{query}%"
     with _connect() as conn:
         rows = conn.execute(
@@ -231,6 +329,33 @@ def search_conversations(query: str, limit: int) -> list[dict]:
             """,
             (pattern, pattern, pattern, limit),
         ).fetchall()
+        hits = conn.execute(
+            """
+            SELECT c.conversation_key AS key, t.i - 1 AS idx
+            FROM conversations c, jsonb_array_elements(c.messages) WITH ORDINALITY t(m, i)
+            WHERE c.conversation_key = ANY(%s) AND t.m->>'content' ILIKE %s
+            ORDER BY 1, 2
+            """,
+            ([row["conversation_key"] for row in rows], pattern),
+        ).fetchall()
+    positions: dict[str, list[int]] = {}
+    for hit in hits:
+        positions.setdefault(hit["key"], []).append(hit["idx"])
+    for row in rows:
+        found = positions.get(row["conversation_key"], [])
+        row["hits"] = len(found)
+        row["sections"] = _keyword_sections(found) if found else []
+    texts = messages_at(
+        [
+            (row["conversation_key"], section["best_message"])
+            for row in rows
+            for section in row["sections"][:EXCERPTED_SECTIONS]
+        ]
+    )
+    for row in rows:
+        for section in row["sections"][:EXCERPTED_SECTIONS]:
+            text = texts.get((row["conversation_key"], section["best_message"]), "")
+            section["excerpt"] = _around(text, query)
     return [_isoformat(row) for row in rows]
 
 
@@ -240,34 +365,47 @@ def _vector_literal(vector: list[float]) -> str:
 
 def semantic_search(vector: list[float], limit: int, min_similarity: float) -> list[dict]:
     """Rank conversations by meaning rather than spelling: pull the closest passages
-    (HNSW does this), then score each conversation by its single best one.
+    (HNSW does this), then score each conversation by its single best one. Each
+    result keeps its body passages from that pull as `hits`, so the caller can tell
+    where in the conversation the match sits.
 
     Vector search always returns *something*, so without a floor every query lists
     the whole archive. Anything below min_similarity is dropped rather than shown."""
     literal = _vector_literal(vector)
     with _connect() as conn:
-        rows = conn.execute(
-            f"""
-            WITH nearest AS (
-                SELECT conversation_id, min(distance) AS distance
-                FROM (
-                    SELECT conversation_id, vec <=> %s::vector AS distance
-                    FROM conversation_chunks
-                    ORDER BY vec <=> %s::vector
-                    LIMIT %s
-                ) close_chunks
-                GROUP BY conversation_id
-            )
-            SELECT {_LIST_COLUMNS}, 1 - nearest.distance AS similarity
-            FROM nearest
-            JOIN conversations ON conversations.id = nearest.conversation_id
-            WHERE nearest.distance <= %s
-            ORDER BY nearest.distance
+        chunks = conn.execute(
+            """
+            SELECT conversation_id, chunk_index, first_message, last_message,
+                   1 - (vec <=> %s::vector) AS similarity
+            FROM conversation_chunks
+            ORDER BY vec <=> %s::vector
             LIMIT %s
             """,
-            (literal, literal, limit * 20, 1 - min_similarity, limit),
+            (literal, literal, limit * 20),
         ).fetchall()
-    return [_isoformat(row) for row in rows]
+        best: dict[int, float] = {}
+        for chunk in chunks:
+            cid = chunk["conversation_id"]
+            best[cid] = max(best.get(cid, 0.0), chunk["similarity"])
+        ranked = [cid for cid in sorted(best, key=best.get, reverse=True) if best[cid] >= min_similarity]
+        ranked = ranked[:limit]
+        if not ranked:
+            return []
+        rows = conn.execute(
+            f"SELECT id, {_LIST_COLUMNS} FROM conversations WHERE id = ANY(%s)", (ranked,)
+        ).fetchall()
+    by_id = {row.pop("id"): row for row in rows}
+    results = []
+    for cid in ranked:
+        row = _isoformat(by_id[cid])
+        row["similarity"] = best[cid]
+        row["hits"] = [
+            {k: chunk[k] for k in ("chunk_index", "first_message", "last_message", "similarity")}
+            for chunk in chunks
+            if chunk["conversation_id"] == cid and chunk["first_message"] is not None
+        ]
+        results.append(row)
+    return results
 
 
 # --- derivation pipeline queries (used by grouping.refresh) ---
@@ -339,9 +477,9 @@ def embeddings_by_id() -> dict[int, list[float]]:
 
 
 def rows_needing_chunks(key: str | None = None) -> list[dict]:
-    """Conversations whose search passages are missing or behind the message list,
-    with how far each was indexed — enough to embed only what changed. Pass `key`
-    to check a single conversation."""
+    """Conversations whose search passages are missing, behind the message list, or
+    still without positions, with how far each was indexed — enough to embed only
+    what changed. Pass `key` to check a single conversation."""
     with _connect() as conn:
         return conn.execute(
             """
@@ -349,7 +487,10 @@ def rows_needing_chunks(key: str | None = None) -> list[dict]:
                    (SELECT count(*) FROM conversation_chunks
                     WHERE conversation_id = conversations.id AND kind = 'body') AS body_chunks
             FROM conversations
-            WHERE chunked_message_count <> jsonb_array_length(messages)
+            WHERE (chunked_message_count <> jsonb_array_length(messages)
+                   OR EXISTS (SELECT 1 FROM conversation_chunks
+                              WHERE conversation_id = conversations.id AND kind = 'body'
+                                AND first_message IS NULL))
               AND (%(key)s::text IS NULL OR conversation_key = %(key)s)
             ORDER BY id
             """,
@@ -376,9 +517,16 @@ def rows_needing_card() -> list[dict]:
 
 
 def replace_body_chunks(
-    row_id: int, start: int, vectors: list[list[float]], message_count: int, indexed_count: int
+    row_id: int,
+    start: int,
+    vectors: list[list[float]],
+    positions: list[tuple[int, int]],
+    message_count: int,
+    indexed_count: int,
 ) -> bool:
     """Swap in body passages from chunk `start` on, keeping the ones before it.
+    `positions` holds every passage's (first, last) message, so kept passages that
+    predate the position columns get theirs too.
 
     The vectors were embedded outside any lock, from the state where `indexed_count`
     messages were indexed. If another run (a refresh, or the indexing after a save)
@@ -398,10 +546,24 @@ def replace_body_chunks(
         )
         with conn.cursor() as cur:
             cur.executemany(
-                "INSERT INTO conversation_chunks (conversation_id, kind, chunk_index, vec)"
-                " VALUES (%s, 'body', %s, %s::vector)",
-                [(row_id, start + i, _vector_literal(v)) for i, v in enumerate(vectors)],
+                "INSERT INTO conversation_chunks"
+                " (conversation_id, kind, chunk_index, vec, first_message, last_message)"
+                " VALUES (%s, 'body', %s, %s::vector, %s, %s)",
+                [
+                    (row_id, start + i, _vector_literal(v), *positions[start + i])
+                    for i, v in enumerate(vectors)
+                ],
             )
+        kept = positions[:start]
+        conn.execute(
+            """
+            UPDATE conversation_chunks AS k SET first_message = p.first, last_message = p.last
+            FROM unnest(%s::int[], %s::int[], %s::int[]) AS p(chunk_index, first, last)
+            WHERE k.conversation_id = %s AND k.kind = 'body'
+              AND k.chunk_index = p.chunk_index AND k.first_message IS NULL
+            """,
+            (list(range(len(kept))), [f for f, _ in kept], [l for _, l in kept], row_id),
+        )
         conn.execute(
             "UPDATE conversations SET chunked_message_count = %s WHERE id = %s",
             (message_count, row_id),

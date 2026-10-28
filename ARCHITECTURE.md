@@ -147,6 +147,20 @@ and a later pass rebuilds every missing card. A missing card is self-healing —
 next refresh notices and rebuilds it — whereas a silently stale one is not, because
 the anchor has already moved and drift will never fire for it again.
 
+Results point inside the conversation. Each passage stores the first and last
+message it covers, so a meaning-search result groups its best passages (within 0.15
+of its best score, at most 10 passages apart) into `sections`: message ranges with
+the best message and an excerpt. Keyword results do the same with the messages that
+contain the word (hits at most 20 messages apart form a section; newest first, older
+ones still listed). `get_conversation` then reads `count` messages from `start`,
+sliced in the database. A page stops at 20,000 characters, inside Claude Code's
+tool-output limit (a single longer message is cut and flagged `truncated`), and a
+conversation under that size comes back whole. A
+section's length is what tells an assistant whether the topic was a passing remark
+or a long discussion worth paging through. Every search and read made through MCP
+lands in `recall_log`, the way to check whether assistants follow a section through
+or stop at the first window.
+
 ## Data model — three layers of columns
 
 | Layer | Columns | Written by |
@@ -154,7 +168,8 @@ the anchor has already moved and drift will never fire for it again.
 | Canonical (immutable) | `conversation_key` `messages` `source` `project` | clients |
 | Derived — LLM | `title` `tags` (importance-ordered array) `summary` `tagged_embedding` (anchor) | refresh, drift-gated |
 | Derived — math | `embedding` (weighted mean) `embedding_vec` (same, pgvector-typed) `embedded_*_count` `cluster_small/big(_label)` `px py pz` | refresh |
-| Search index | `conversation_chunks(conversation_id, kind, chunk_index, vec)` + `chunked_message_count` | each save (body passages, background) · refresh (cards, catch-up) |
+| Search index | `conversation_chunks(conversation_id, kind, chunk_index, vec, first_message, last_message)` + `chunked_message_count` | each save (body passages, background) · refresh (cards, catch-up) |
+| Usage log | `recall_log(tool, args, result)` — a separate table | the MCP search and read tools |
 
 Drift is evaluated in SQL (`embedding <=> tagged_embedding`), so the metadata phase
 never carries vectors in memory — they are loaded only for clustering and the 3D

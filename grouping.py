@@ -54,6 +54,14 @@ CHUNK_CHARS = 1500
 # query returns the whole archive, since vector search always ranks something first.
 MIN_SIMILARITY = 0.30
 
+# A conversation's sections are built from its passages scoring within SECTION_MARGIN
+# of its best one; passages at most SECTION_GAP apart (in passage order) join one
+# section. First guesses from one query on 2026-10-28 ("GitBook card", top ten
+# passages within 0.14 of the best and at most 10 apart) — re-measure with a query set.
+SECTION_MARGIN = 0.15
+SECTION_GAP = 10
+MAX_SECTIONS = 3
+
 
 def _embed_texts(texts: list[str]) -> list[list[float]]:
     """Search passages are long enough that a full batch can exceed the per-minute
@@ -76,20 +84,24 @@ def _embed_texts(texts: list[str]) -> list[list[float]]:
     return vectors
 
 
-def _passages(messages: list[dict]) -> list[str]:
+def _passages(messages: list[dict]) -> list[tuple[int, int, str]]:
     """Glue consecutive messages into ~CHUNK_CHARS passages, skipping the short
-    chatter that MIN_CHARS already excludes from the mean."""
-    passages, buf = [], ""
-    for message in messages:
+    chatter that MIN_CHARS already excludes from the mean. Each passage comes as
+    (first message index, last message index, text)."""
+    passages, buf, first, last = [], "", 0, 0
+    for i, message in enumerate(messages):
         content = (message.get("content") or "").strip()
         if len(content) < MIN_CHARS:
             continue
+        if not buf:
+            first = i
         buf += content[:6000] + "\n"
+        last = i
         if len(buf) >= CHUNK_CHARS:
-            passages.append(buf[:6000])
+            passages.append((first, last, buf[:6000]))
             buf = ""
     if buf.strip():
-        passages.append(buf[:6000])
+        passages.append((first, last, buf[:6000]))
     return passages
 
 
@@ -108,9 +120,13 @@ def _index_body_chunks(row: dict) -> int:
     messages = row["messages"]
     rewritten = len(messages) < row["chunked_message_count"]
     start = 0 if rewritten else max(row["body_chunks"] - 1, 0)
-    passages = _passages(messages)[start:]
-    vectors = _embed_texts(passages) if passages else []
-    db.replace_body_chunks(row["id"], start, vectors, len(messages), row["chunked_message_count"])
+    passages = _passages(messages)
+    texts = [text for _, _, text in passages[start:]]
+    vectors = _embed_texts(texts) if texts else []
+    positions = [(first, last) for first, last, _ in passages]
+    db.replace_body_chunks(
+        row["id"], start, vectors, positions, len(messages), row["chunked_message_count"]
+    )
     return len(vectors)
 
 
@@ -158,8 +174,51 @@ def semantic_search(query: str, limit: int) -> list[dict]:
 
     Ranking only needs relative order, so the stored vectors work as they are —
     unlike clustering, which needs absolute distances and hence per-language
-    centering (see _center_by_language)."""
-    return db.semantic_search(_embed_texts([query])[0], limit, MIN_SIMILARITY)
+    centering (see _center_by_language).
+
+    Each result also gets `sections`: where in the conversation the match sits, so an
+    assistant can open that stretch instead of the whole conversation."""
+    results = db.semantic_search(_embed_texts([query])[0], limit, MIN_SIMILARITY)
+    for result in results:
+        result["sections"] = _sections(result.pop("hits"))
+    texts = db.messages_at(
+        [(r["conversation_key"], s["best_message"]) for r in results for s in r["sections"]]
+    )
+    for result in results:
+        for section in result["sections"]:
+            text = texts.get((result["conversation_key"], section["best_message"]), "")
+            section["excerpt"] = text[: db.EXCERPT_CHARS]
+    return results
+
+
+def _sections(hits: list[dict]) -> list[dict]:
+    """Merge a conversation's best-scoring passages into stretches of messages, best
+    first. The stretch's length is what tells an assistant whether the topic is a
+    passing remark or a long discussion it should keep reading."""
+    if not hits:
+        return []
+    floor = max(h["similarity"] for h in hits) - SECTION_MARGIN
+    close = sorted((h for h in hits if h["similarity"] >= floor), key=lambda h: h["chunk_index"])
+    groups = [[close[0]]]
+    for hit in close[1:]:
+        if hit["chunk_index"] - groups[-1][-1]["chunk_index"] <= SECTION_GAP:
+            groups[-1].append(hit)
+        else:
+            groups.append([hit])
+    sections = []
+    for group in groups:
+        top = max(group, key=lambda h: h["similarity"])
+        start, end = group[0]["first_message"], group[-1]["last_message"]
+        sections.append(
+            {
+                "start": start,
+                "end": end,
+                "length": end - start + 1,
+                "best_message": top["first_message"],
+                "similarity": round(top["similarity"], 3),
+            }
+        )
+    return sorted(sections, key=lambda s: s["similarity"], reverse=True)[:MAX_SECTIONS]
 
 
 def _update_conversation_vector(row: dict, texts: list[str]) -> int:

@@ -24,8 +24,9 @@ the archive and see the groups on a 3D map.
   transcript, so it spends no model tokens.
 - **Recalling.** Any connected assistant can look up earlier conversations: by keyword
   with `search_conversations`, or by topic with `search_conversations_by_meaning` when
-  it doesn't know the exact words. `get_conversation` then reads one: the summary
-  first, the verbatim messages when it needs the details.
+  it doesn't know the exact words. Results say where in a conversation the match
+  sits, so `get_conversation` can open that stretch instead of the whole
+  conversation: the summary first, the verbatim messages when it needs the details.
 - **Reopening.** Each conversation keeps a way back to the app it came from. Claude
   Code stores a `cd <project> && claude --resume <session-id>` command, and claude.ai
   stores the chat URL, which the assistant asks the user to paste. The dashboard shows
@@ -54,10 +55,10 @@ measurements behind each tuned value.
 |---|---|
 | `save_conversation(messages, source?, project?, key?)` | Create a conversation (the server issues a `cw-`+UUID key when none is given), or overwrite one to repair it |
 | `append_messages(key, new_messages, project?, source_url?)` | Append the latest turn; an identical resend is ignored. `source_url` stores the chat's address for reopening |
-| `get_conversation(key, full=False, last=20)` | Load one conversation, summary first; `full=true` adds the verbatim messages, the most recent 20 unless `last` says otherwise (`last=0` for all) |
+| `get_conversation(key, full=False, start?, count=20)` | Load one conversation, summary first. `full=true` adds the verbatim messages: a short conversation whole, a long one `count` messages from `start` (default: the most recent; `count=0` for no count limit), with `next_start`/`prev_start` to keep reading. A page never exceeds 20,000 characters |
 | `list_conversations(limit)` | Recent conversations, without message bodies |
-| `search_conversations(query, limit)` | Keyword search over title, summary and content |
-| `search_conversations_by_meaning(query, limit)` | Meaning search for a topic whose exact words are unknown; new messages become searchable seconds after they are saved |
+| `search_conversations(query, limit)` | Keyword search over title, summary and content; each result lists where the keyword occurs (`sections`, newest first) |
+| `search_conversations_by_meaning(query, limit)` | Meaning search for a topic whose exact words are unknown; each result lists the stretches where it is discussed (`sections`). New messages become searchable seconds after they are saved |
 
 ## Tech Stack
 
