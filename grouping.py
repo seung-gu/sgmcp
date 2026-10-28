@@ -223,12 +223,19 @@ def semantic_search(query: str, limit: int) -> list[dict]:
     results = db.semantic_search(_embed_texts([query])[0], limit, MIN_SIMILARITY)
     for result in results:
         result["sections"] = _sections(result.pop("hits"))
-    texts = db.messages_at(
-        [(r["conversation_key"], s["best_message"]) for r in results for s in r["sections"]]
+    found = db.messages_at(
+        [
+            (r["conversation_key"], s[field])
+            for r in results
+            for s in r["sections"]
+            for field in ("start", "end", "best_message")
+        ]
     )
     for result in results:
+        key = result["conversation_key"]
+        db.add_section_times(result["sections"], key, found)
         for section in result["sections"]:
-            text = texts.get((result["conversation_key"], section["best_message"]), "")
+            text = found.get((key, section["best_message"]), {}).get("content", "")
             section["excerpt"] = text[: db.EXCERPT_CHARS]
     return results
 

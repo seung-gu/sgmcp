@@ -57,7 +57,7 @@ measurements behind each tuned value.
 |---|---|
 | `save_conversation(messages, source?, project?, key?)` | Create a conversation (the server issues a `cw-`+UUID key when none is given), or overwrite one to repair it |
 | `append_messages(key, new_messages, project?, source_url?)` | Append the latest turn; an identical resend is ignored. `source_url` stores the chat's address for reopening |
-| `get_conversation(key, full=False, start?, count=20)` | Load one conversation, summary first. `full=true` adds the verbatim messages: a short conversation whole, a long one `count` messages from `start` (default: the most recent; `count=0` for no count limit), with `next_start`/`prev_start` to keep reading. A page never exceeds 20,000 characters |
+| `get_conversation(key, full=False, start?, count=20)` | Load one conversation, summary first. `full=true` adds the verbatim messages: a short conversation whole, a long one `count` messages from `start` (default: the most recent; `count=0` for no count limit), with `next_start`/`prev_start` to keep reading. A page never exceeds 20,000 characters, and each message carries its time (`at`) |
 | `list_conversations(limit)` | Recent conversations, without message bodies |
 | `search_conversations(query, limit)` | Keyword search over title, summary and content; each result lists where the keyword occurs (`sections`, newest first) |
 | `search_conversations_by_meaning(query, limit)` | Meaning search for a topic whose exact words are unknown; each result lists the stretches where it is discussed (`sections`). New messages become searchable seconds after they are saved |

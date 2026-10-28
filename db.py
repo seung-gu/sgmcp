@@ -1,6 +1,7 @@
 # Conversation storage and derived-data queries — Postgres (requires DATABASE_URL)
 
 import os
+from datetime import datetime, timezone
 
 import psycopg
 from psycopg.rows import dict_row
@@ -148,14 +149,35 @@ def _sync_messages(conn, conversation_id: int, messages: list[dict], replace: bo
         == (r["role"], r["content"])
         for r in stored
     )
+    previous: dict[int, dict] = {}
     if replace or not unchanged:
+        previous = {
+            r["idx"]: r
+            for r in conn.execute(
+                "SELECT idx, role, content, at FROM messages WHERE conversation_id = %s",
+                (conversation_id,),
+            )
+        }
         conn.execute("DELETE FROM messages WHERE conversation_id = %s", (conversation_id,))
         kept = 0
+    now = datetime.now(timezone.utc)
+
+    def at_of(i: int, message: dict):
+        """The time the client sent; else, for a message that survives a rewrite in
+        place, the time it already had (even if unknown); else now, as it just arrived."""
+        if message.get("at"):
+            return message["at"]
+        old = previous.get(i)
+        if old and (old["role"], old["content"]) == (message.get("role"), message.get("content")):
+            return old["at"]
+        return now
+
     with conn.cursor() as cur:
         cur.executemany(
-            "INSERT INTO messages (conversation_id, idx, role, content) VALUES (%s, %s, %s, %s)",
+            "INSERT INTO messages (conversation_id, idx, role, content, at)"
+            " VALUES (%s, %s, %s, %s, %s::timestamptz)",
             [
-                (conversation_id, i, m.get("role", ""), m.get("content", ""))
+                (conversation_id, i, m.get("role", ""), m.get("content", ""), at_of(i, m))
                 for i, m in enumerate(messages[kept:], start=kept)
             ],
         )
@@ -244,11 +266,13 @@ def append_messages(
                 "total_messages": current,
                 "note": "duplicate turn — skipped",
             }
+        now = datetime.now(timezone.utc)
         with conn.cursor() as cur:
             cur.executemany(
-                "INSERT INTO messages (conversation_id, idx, role, content) VALUES (%s, %s, %s, %s)",
+                "INSERT INTO messages (conversation_id, idx, role, content, at)"
+                " VALUES (%s, %s, %s, %s, %s::timestamptz)",
                 [
-                    (row["id"], current + i, m.get("role", ""), m.get("content", ""))
+                    (row["id"], current + i, m.get("role", ""), m.get("content", ""), m.get("at") or now)
                     for i, m in enumerate(new_messages)
                 ],
             )
@@ -337,15 +361,20 @@ def conversation_messages(key: str, start: int, stop: int) -> list[dict]:
     """messages[start:stop], read by index range so a long conversation never travels
     whole."""
     with _connect() as conn:
-        return conn.execute(
+        rows = conn.execute(
             """
-            SELECT m.role, m.content
+            SELECT m.role, m.content, m.at
             FROM messages m JOIN conversations c ON c.id = m.conversation_id
             WHERE c.conversation_key = %s AND m.idx >= %s AND m.idx < %s
             ORDER BY m.idx
             """,
             (key, start, stop),
         ).fetchall()
+    return [{**row, "at": _iso(row["at"])} for row in rows]
+
+
+def _iso(at: datetime | None) -> str | None:
+    return at.isoformat() if at else None
 
 
 def log_recall(tool: str, args: dict, result: dict) -> None:
@@ -356,21 +385,29 @@ def log_recall(tool: str, args: dict, result: dict) -> None:
         )
 
 
-def messages_at(spots: list[tuple[str, int]]) -> dict[tuple[str, int], str]:
-    """The text of selected messages, as (conversation_key, index) -> content."""
+def messages_at(spots: list[tuple[str, int]]) -> dict[tuple[str, int], dict]:
+    """Selected messages, as (conversation_key, index) -> {content, at}."""
     if not spots:
         return {}
     with _connect() as conn:
         rows = conn.execute(
             """
-            SELECT s.key, s.idx, m.content
+            SELECT s.key, s.idx, m.content, m.at
             FROM unnest(%s::text[], %s::int[]) AS s(key, idx)
             JOIN conversations c ON c.conversation_key = s.key
             JOIN messages m ON m.conversation_id = c.id AND m.idx = s.idx
             """,
             ([key for key, _ in spots], [idx for _, idx in spots]),
         ).fetchall()
-    return {(r["key"], r["idx"]): r["content"] or "" for r in rows}
+    return {(r["key"], r["idx"]): {"content": r["content"] or "", "at": _iso(r["at"])} for r in rows}
+
+
+def add_section_times(sections: list[dict], key: str, found: dict) -> None:
+    """Stamp each section with the time of its first and last message, so a question
+    like "what did we do last night" can be matched to the right stretch."""
+    for section in sections:
+        section["start_at"] = found.get((key, section["start"]), {}).get("at")
+        section["end_at"] = found.get((key, section["end"]), {}).get("at")
 
 
 # Keyword hits at most this many messages apart belong to one section.
@@ -433,16 +470,18 @@ def search_conversations(query: str, limit: int) -> list[dict]:
         found = positions.get(row["conversation_key"], [])
         row["hits"] = len(found)
         row["sections"] = _keyword_sections(found) if found else []
-    texts = messages_at(
-        [
-            (row["conversation_key"], section["best_message"])
-            for row in rows
-            for section in row["sections"][:EXCERPTED_SECTIONS]
-        ]
-    )
+    spots = []
     for row in rows:
+        for n, section in enumerate(row["sections"]):
+            spots += [(row["conversation_key"], section["start"]), (row["conversation_key"], section["end"])]
+            if n < EXCERPTED_SECTIONS:
+                spots.append((row["conversation_key"], section["best_message"]))
+    found = messages_at(spots)
+    for row in rows:
+        key = row["conversation_key"]
+        add_section_times(row["sections"], key, found)
         for section in row["sections"][:EXCERPTED_SECTIONS]:
-            text = texts.get((row["conversation_key"], section["best_message"]), "")
+            text = found.get((key, section["best_message"]), {}).get("content", "")
             section["excerpt"] = _around(text, query)
     return [_isoformat(row) for row in rows]
 

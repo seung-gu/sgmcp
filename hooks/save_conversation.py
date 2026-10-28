@@ -57,7 +57,7 @@ def _extract(transcript_path: Path) -> tuple[list[dict], str]:
         text = _text_of(entry.get("message", {}).get("content"))
         if not text or text.startswith("Caveat:") or any(m in text for m in NOISE_MARKERS):
             continue
-        messages.append({"role": entry["type"], "content": text})
+        messages.append({"role": entry["type"], "content": text, "at": entry.get("timestamp")})
     return messages, cwd
 
 

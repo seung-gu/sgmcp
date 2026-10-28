@@ -173,6 +173,14 @@ or a long discussion worth paging through. Every search and read made through MC
 lands in `recall_log`, the way to check whether assistants follow a section through
 or stop at the first window.
 
+Messages carry the time they were sent (`at`): the transcript's timestamp for Claude
+Code, the moment the save arrived for claude.ai (so a turn's messages share it). A
+rewrite keeps the time of every message that survives it in place. Sections report
+when their first and last message were sent (`start_at`, `end_at`), which is what
+lets "what did we do last night" land on the right stretch. Messages saved before
+times were recorded have none, unless their Claude Code transcript was still on disk
+to fill them from — Claude Code deletes transcripts after `cleanupPeriodDays`.
+
 ## Data model — three layers of columns
 
 | Layer | Columns | Written by |

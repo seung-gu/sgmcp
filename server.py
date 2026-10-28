@@ -139,7 +139,8 @@ def get_conversation(
     verbatim messages: a short conversation comes back whole, a long one returns `count`
     messages from `start` (default: the most recent). `showing` is the range returned and
     `message_count` the total; continue with `next_start` or `prev_start`. A single
-    message longer than a page comes back cut, marked `truncated`."""
+    message longer than a page comes back cut, marked `truncated`. Each message carries
+    `at`, when it was sent (null where the archive never learned it)."""
     conversation = db.conversation_overview(conversation_key)
     if conversation is None:
         raise ValueError(
@@ -190,7 +191,8 @@ def search_conversations(
     For a topic whose exact wording you don't know, use search_conversations_by_meaning.
     Each result counts the messages containing the keyword (`hits`) and groups them into
     `sections` (message ranges, newest first; `best_message` is the latest hit), the
-    newest few with an `excerpt` around the keyword. Older sections are listed too —
+    newest few with an `excerpt` around the keyword, each with the time of its first and
+    last message (`start_at`, `end_at`). Older sections are listed too —
     check them when the newest one does not answer. Read a section with
     get_conversation, passing `start` a few messages before `best_message`."""
     results = db.search_conversations(query, limit)
@@ -216,7 +218,8 @@ def search_conversations_by_meaning(
 
     Each result lists `sections`: stretches of the conversation where the topic is
     discussed (`start`–`end`, `length` messages), with the best-matching message
-    (`best_message`) and an `excerpt` of it. To read one, call get_conversation with
+    (`best_message`), an `excerpt` of it, and when the stretch ran (`start_at`,
+    `end_at`). To read one, call get_conversation with
     `start` a few messages before `best_message`. If a section is much longer than what
     you have read, the topic continues there: for a specific fact the area around
     `best_message` is usually enough; for what happened or what was decided, keep
