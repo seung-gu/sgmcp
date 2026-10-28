@@ -25,6 +25,10 @@ def register(mcp) -> None:
         if not _authorized(request):
             return JSONResponse({"error": "unauthorized"}, status_code=403)
         body = await request.json()
+        # `start` > 0: `messages` is only the session's end, beginning at that position
+        start = body.get("start", 0)
+        if not isinstance(start, int) or start < 0:
+            return JSONResponse({"error": "start must be a non-negative integer"}, status_code=400)
         try:
             result = await run_in_threadpool(
                 db.save_conversation,
@@ -33,8 +37,12 @@ def register(mcp) -> None:
                 body.get("source", ""),
                 body.get("project", ""),
                 body.get("source_url", ""),
+                start=start,
             )
         except KeyError as e:
             return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        if result is None:
+            # the stored messages stop before that end, or differ from it
+            return JSONResponse({"error": "send the whole session"}, status_code=409)
         grouping.index_soon(body["conversation_key"])
         return JSONResponse(result)

@@ -57,8 +57,8 @@ measurements behind each tuned value.
 | Tool | What it does |
 |---|---|
 | `save_conversation(messages, source?, project?, key?)` | Create a conversation (the server issues a `cw-`+UUID key when none is given), or overwrite one to repair it |
-| `append_messages(key, new_messages, project?, source_url?)` | Append the latest turn; an identical resend is ignored. `source_url` stores the chat's address for reopening |
-| `get_conversation(key, full=False, start?, count?)` | Load one conversation, summary first. `full=true` adds the verbatim messages one page (about 20,000 characters) at a time: from `start`, or the most recent when omitted, so a short conversation comes back whole. `count` caps the number of messages; `next_start`/`prev_start` keep reading. Each message carries its time (`at`) |
+| `append_messages(key, new_messages, project?, source_url?)` | Append the messages not saved yet: the latest turn, plus any turn whose save was skipped. Messages already saved are stored once. `source_url` stores the chat's address for reopening |
+| `get_conversation(key, full=False, start?, count?)` | Load one conversation, summary first. `full=true`, `start` or `count` adds the verbatim messages one page (about 20,000 characters) at a time: from `start`, or the most recent when omitted, so a short conversation comes back whole. `count` caps the number of messages; `next_start`/`prev_start` keep reading. Each message carries its time (`at`) |
 | `list_conversations(limit)` | Recent conversations, without message bodies |
 | `search_conversations(query, limit)` | Keyword search over title, summary and content; each result lists where the keyword occurs (`sections`, newest first) |
 | `search_conversations_by_meaning(query, limit)` | Meaning search for a topic whose exact words are unknown; each result lists the stretches where it is discussed (`sections`). New messages become searchable seconds after they are saved |
@@ -113,8 +113,9 @@ and the connection fails.
 - **Claude Code**: `claude mcp add --transport http sgmcp https://<your-app>.fly.dev/mcp`
 - **claude.ai**: Settings → Connectors → Add custom connector → `https://<your-app>.fly.dev/mcp`
 - **Claude Code auto-save**: register `hooks/save_conversation.py` as a global Stop
-  hook and put `INGEST_TOKEN` in the local `.env`. It upserts the session through
-  `/api/ingest` after every turn; run it with `--backfill` to push past sessions.
+  hook and put `INGEST_TOKEN` in the local `.env`. After every turn it sends the
+  session's last 20 messages to `/api/ingest`, and the whole session only when the
+  server is further behind; run it with `--backfill` to push past sessions.
 
 ### Deploying
 
@@ -140,4 +141,4 @@ fly deploy --ha=false                                      # Fly.io; the schema 
 
 - [ ] Authentication on the `/mcp` endpoint
 - [ ] Split conversations that mix two topics, so each part lands in its own group
-- [ ] "Conversations similar to this one", using the vector column that is already kept in sync
+- [ ] "Conversations similar to this one" on the dashboard, by running meaning search with the conversation's card

@@ -18,7 +18,6 @@ _SCHEMA = [
         title TEXT NOT NULL,
         source TEXT NOT NULL DEFAULT '',
         tags TEXT[] NOT NULL DEFAULT '{}',
-        messages JSONB NOT NULL,
         created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
         updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
     )
@@ -26,7 +25,6 @@ _SCHEMA = [
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS project TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS summary TEXT NOT NULL DEFAULT ''",
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS embedding REAL[]",
-    "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS embedded_at TIMESTAMPTZ",
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS cluster_small INT",
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS cluster_small_label TEXT",
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS cluster_big INT",
@@ -35,18 +33,9 @@ _SCHEMA = [
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS py REAL",
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS pz REAL",
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS embedded_message_count INT NOT NULL DEFAULT 0",
-    "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS embedded_vector_count INT NOT NULL DEFAULT 0",
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS tagged_embedding REAL[]",
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS source_url TEXT NOT NULL DEFAULT ''",
-    # embedding_vec mirrors `embedding` in pgvector's own type, with an HNSW index, for
-    # "conversations similar to this one" (Future Ideas). Nothing reads it yet — meaning
-    # search runs on conversation_chunks. `embedding` stays the column the pipeline reads.
     "CREATE EXTENSION IF NOT EXISTS vector",
-    f"ALTER TABLE conversations ADD COLUMN IF NOT EXISTS embedding_vec vector({EMBED_DIMENSIONS})",
-    """
-    CREATE INDEX IF NOT EXISTS conversations_embedding_hnsw
-        ON conversations USING hnsw (embedding_vec vector_cosine_ops)
-    """,
     # Search index. A conversation's average vector answers "what is this about",
     # which is what clustering needs but too blurry to search: measured 48% top-1.
     # Scoring a conversation by its best-matching passage instead gives 68%, so
@@ -83,8 +72,7 @@ _SCHEMA = [
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS chunk_version INT NOT NULL DEFAULT 1",
     # One row per message, replacing the `messages` array: appending a turn writes a
     # few rows instead of rewriting the whole array (2.7 MB, ~2 s for the largest
-    # conversation). The array column is no longer written or read; it stays, frozen,
-    # until it is dropped.
+    # conversation).
     """
     CREATE TABLE IF NOT EXISTS messages (
         conversation_id BIGINT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
@@ -110,7 +98,8 @@ _SCHEMA = [
 ]
 
 # Ask the model to request the conversation URL when it's still missing and the
-# message count hits this (== 1 mod 40, i.e. round-trips 1, 21, 41, …).
+# message count passes 1, 41, 81, … (round-trips 1, 21, 41, …). Passes, not hits: a
+# save adds two or more messages, so the count steps over most exact values.
 URL_PROMPT_EVERY = 40
 
 _schema_ready = False
@@ -141,25 +130,36 @@ def _isoformat(row: dict) -> dict:
 TAIL_CHECK = 20
 
 
-def _sync_messages(conn, conversation_id: int, messages: list[dict], replace: bool) -> None:
+def _sync_messages(
+    conn, conversation_id: int, messages: list[dict], replace: bool, start: int = 0
+) -> bool:
     """Make the messages table hold exactly `messages` for one conversation.
 
     Normally the stored rows are a prefix of `messages` and only the tail is inserted.
     When the last TAIL_CHECK stored rows differ from the same positions (the
     conversation was rewritten), or `replace` is set, every row is rewritten. A content
     change further back that keeps the count goes unnoticed — which is why an explicit
-    repair passes `replace`."""
+    repair passes `replace`.
+
+    `messages` may also be only the end of the conversation, from position `start` on.
+    Nothing before it is at hand to rewrite with, so such an end must overlap the
+    stored rows and agree with them. Otherwise nothing is written and this returns
+    False, for the caller to ask for the whole conversation."""
     stored = conn.execute(
         "SELECT idx, role, content FROM messages WHERE conversation_id = %s"
         " ORDER BY idx DESC LIMIT %s",
         (conversation_id, TAIL_CHECK),
     ).fetchall()
     kept = stored[0]["idx"] + 1 if stored else 0
-    unchanged = kept <= len(messages) and all(
-        (messages[r["idx"]].get("role"), messages[r["idx"]].get("content"))
+    total = start + len(messages)
+    unchanged = kept <= total and all(
+        (messages[r["idx"] - start].get("role"), messages[r["idx"] - start].get("content"))
         == (r["role"], r["content"])
         for r in stored
+        if r["idx"] >= start
     )
+    if start and (replace or not unchanged or kept <= start):
+        return False
     # times of the rows being replaced, by content: a message that survives the rewrite
     # keeps its time even when removals earlier in the list shifted its position
     previous: dict[tuple[str, str], list] = {}
@@ -179,7 +179,7 @@ def _sync_messages(conn, conversation_id: int, messages: list[dict], replace: bo
         conn.execute(
             """
             UPDATE conversations
-            SET chunk_version = 0, embedding = NULL, embedding_vec = NULL,
+            SET chunk_version = 0, embedding = NULL,
                 embedded_message_count = 0
             WHERE id = %s
             """,
@@ -201,13 +201,14 @@ def _sync_messages(conn, conversation_id: int, messages: list[dict], replace: bo
             " VALUES (%s, %s, %s, %s, %s::timestamptz)",
             [
                 (conversation_id, i, m.get("role", ""), m.get("content", ""), at_of(m))
-                for i, m in enumerate(messages[kept:], start=kept)
+                for i, m in enumerate(messages[kept - start:], start=kept)
             ],
         )
     conn.execute(
         "UPDATE conversations SET message_count = %s WHERE id = %s",
-        (len(messages), conversation_id),
+        (total, conversation_id),
     )
+    return True
 
 
 def save_conversation(
@@ -217,7 +218,8 @@ def save_conversation(
     project: str = "",
     source_url: str = "",
     replace: bool = False,
-) -> dict:
+    start: int = 0,
+) -> dict | None:
     """Create a conversation, or overwrite it wholesale (repair). Title, tags and
     summary are filled in by server-side derivation.
 
@@ -227,12 +229,15 @@ def save_conversation(
     (an overwrite that keeps or grows the count doesn't waste a re-embed).
 
     The messages go to the messages table: `replace` rewrites every row (an explicit
-    repair); otherwise only the new tail is written (see _sync_messages)."""
+    repair); otherwise only the new tail is written (see _sync_messages). With `start`
+    above 0, `messages` is only the conversation's end; when that end does not attach
+    to the stored rows, nothing is saved and None is returned."""
+    total = start + len(messages)
     with _connect() as conn:
         row = conn.execute(
             """
-            INSERT INTO conversations (conversation_key, title, messages, source, project, source_url)
-            VALUES (%(key)s, '', '[]'::jsonb, %(source)s, %(project)s, %(url)s)
+            INSERT INTO conversations (conversation_key, title, source, project, source_url)
+            VALUES (%(key)s, '', %(source)s, %(project)s, %(url)s)
             ON CONFLICT (conversation_key) DO UPDATE
                 SET source = EXCLUDED.source,
                     project = CASE WHEN EXCLUDED.project <> '' THEN EXCLUDED.project
@@ -241,8 +246,6 @@ def save_conversation(
                                       ELSE conversations.source_url END,
                     embedding = CASE WHEN %(count)s < conversations.embedded_message_count
                                      THEN NULL ELSE conversations.embedding END,
-                    embedding_vec = CASE WHEN %(count)s < conversations.embedded_message_count
-                                         THEN NULL ELSE conversations.embedding_vec END,
                     embedded_message_count = CASE WHEN %(count)s < conversations.embedded_message_count
                                                   THEN 0 ELSE conversations.embedded_message_count END,
                     tagged_embedding = CASE WHEN %(count)s < conversations.embedded_message_count
@@ -250,12 +253,14 @@ def save_conversation(
                     updated_at = now()
             RETURNING id, (created_at = updated_at) AS is_new
             """,
-            {"key": key, "source": source, "project": project, "url": source_url, "count": len(messages)},
+            {"key": key, "source": source, "project": project, "url": source_url, "count": total},
         ).fetchone()
-        _sync_messages(conn, row["id"], messages, replace)
+        if not _sync_messages(conn, row["id"], messages, replace, start):
+            conn.rollback()
+            return None
     return {
         "conversation_key": key,
-        "message_count": len(messages),
+        "message_count": total,
         "saved_as": "created" if row["is_new"] else "overwritten",
     }
 
@@ -275,12 +280,21 @@ def append_messages(
             return None
         current = row["message_count"]
         n = len(new_messages)
-        tail = conn.execute(
-            "SELECT role, content FROM messages WHERE conversation_id = %s AND idx >= %s ORDER BY idx",
-            (row["id"], current - n),
-        ).fetchall()
-        # duplicate guard: ignore a turn identical to the current tail (retry safety)
-        if n == 0 or [{"role": r["role"], "content": r["content"]} for r in tail] == new_messages:
+        stored = [
+            (r["role"], r["content"])
+            for r in conn.execute(
+                "SELECT role, content FROM messages WHERE conversation_id = %s AND idx >= %s ORDER BY idx",
+                (row["id"], current - n),
+            )
+        ]
+        sent = [(m.get("role"), m.get("content")) for m in new_messages]
+        # duplicate guard: messages at the start that repeat the stored end (a retry, or
+        # a batch reaching back past the last save) are stored only once
+        resent = min(n, len(stored))
+        while sent[:resent] != stored[len(stored) - resent:]:
+            resent -= 1
+        fresh = new_messages[resent:]
+        if not fresh:
             return {
                 "conversation_key": key,
                 "appended": 0,
@@ -294,10 +308,10 @@ def append_messages(
                 " VALUES (%s, %s, %s, %s, %s::timestamptz)",
                 [
                     (row["id"], current + i, m.get("role", ""), m.get("content", ""), m.get("at") or now)
-                    for i, m in enumerate(new_messages)
+                    for i, m in enumerate(fresh)
                 ],
             )
-        total = current + n
+        total = current + len(fresh)
         conn.execute(
             """
             UPDATE conversations
@@ -310,9 +324,9 @@ def append_messages(
             (total, project, project, source_url, source_url, row["id"]),
         )
     has_url = bool(row["source_url"] or source_url)
-    result = {"conversation_key": key, "appended": n, "total_messages": total}
+    result = {"conversation_key": key, "appended": len(fresh), "total_messages": total}
     # periodically nudge the model to ask the user for this conversation's URL
-    if not has_url and total % URL_PROMPT_EVERY == 1:
+    if not has_url and (current - 1) // URL_PROMPT_EVERY < (total - 1) // URL_PROMPT_EVERY:
         result["ask_for_url"] = True
     return result
 
@@ -598,13 +612,10 @@ def set_embedding_state(row_id: int, mean: list[float], message_count: int) -> N
         conn.execute(
             """
             UPDATE conversations
-            SET embedding = %s::real[],
-                embedding_vec = %s::real[]::vector,
-                embedded_message_count = %s,
-                embedded_at = now()
+            SET embedding = %s::real[], embedded_message_count = %s
             WHERE id = %s
             """,
-            (mean, mean, message_count, row_id),
+            (mean, message_count, row_id),
         )
 
 

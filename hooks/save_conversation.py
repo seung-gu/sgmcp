@@ -5,7 +5,9 @@
 #   (backfill) python hooks/save_conversation.py --backfill   # push every past session
 #
 # Always exits 0 — it must never disturb the Claude Code session.
-# Each turn re-upserts the full state, so any missed turn heals on the next one.
+# Each turn sends only the session's last TAIL messages and the server adds the ones it
+# lacks. When it lacks more (a run of failed turns) or holds something different, it
+# answers 409 and the whole session goes instead, so any missed turn heals on the next.
 
 import json
 import sys
@@ -16,6 +18,10 @@ import httpx
 SERVER = "https://sgmcp-seunggu.fly.dev"
 ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
 LOG_PATH = Path.home() / ".claude" / "sgmcp-hook.log"
+
+# Messages sent per turn. A turn adds a few; the rest overlap what the server already
+# holds, which lets it check that it is extending the same list.
+TAIL = 20
 
 # client noise that is not conversation content (e.g. /clear banners)
 NOISE_MARKERS = ("<command-name>", "<local-command-stdout>")
@@ -61,6 +67,15 @@ def _extract(transcript_path: Path) -> tuple[list[dict], str]:
     return messages, cwd
 
 
+def _post(payload: dict) -> httpx.Response:
+    return httpx.post(
+        f"{SERVER}/api/ingest",
+        json=payload,
+        headers={"Authorization": f"Bearer {_token()}"},
+        timeout=60,
+    )
+
+
 def _push(session_id: str, transcript_path: Path) -> str:
     messages, cwd = _extract(transcript_path)
     if not messages:
@@ -72,19 +87,16 @@ def _push(session_id: str, transcript_path: Path) -> str:
         resume = f"cd {cwd} && {resume}"
     payload = {
         "conversation_key": f"cc-{session_id}",
-        "messages": messages,
         "source": "claude-code",
         "project": Path(cwd).name if cwd else "",
         # the dashboard shows source_url uniformly, so Claude Code fills in its
         # resume command here (claude.ai fills in a URL)
         "source_url": resume,
     }
-    response = httpx.post(
-        f"{SERVER}/api/ingest",
-        json=payload,
-        headers={"Authorization": f"Bearer {_token()}"},
-        timeout=60,
-    )
+    start = max(0, len(messages) - TAIL)
+    response = _post({**payload, "messages": messages[start:], "start": start})
+    if response.status_code == 409:
+        response = _post({**payload, "messages": messages})
     response.raise_for_status()
     return f"{session_id}: {response.json()}"
 

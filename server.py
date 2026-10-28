@@ -71,7 +71,8 @@ def append_messages(
     new_messages: Annotated[
         list[Message],
         Field(
-            description="only the latest turn's messages — do not resend messages already saved",
+            description="the messages not saved yet, in order: normally the latest turn, "
+            "plus any earlier turn whose save was skipped",
             min_length=1,
         ),
     ],
@@ -87,8 +88,9 @@ def append_messages(
         ),
     ] = "",
 ) -> dict:
-    """Appends the latest turn to an existing conversation. Use this for per-turn saving.
-    Sending the same content twice in a row is ignored automatically (duplicate guard).
+    """Appends the messages not saved yet to an existing conversation. Use this for
+    per-turn saving. Messages that repeat the end of what is already saved (a retry, or
+    a turn sent again) are stored only once (duplicate guard).
 
     If the response contains "ask_for_url": true, ask the user once to paste this
     conversation's URL from their address bar, then pass it as source_url next time."""
@@ -112,8 +114,9 @@ def get_conversation(
     full: Annotated[
         bool,
         Field(
-            description="false: summary-centric, lightweight. true: include the verbatim "
-            "messages — only when continuing the conversation or quoting exactly"
+            description="false: summary-centric, lightweight. true: include the most recent "
+            "verbatim messages — only when continuing the conversation or quoting exactly. "
+            "Not needed with start or count, which include messages on their own"
         ),
     ] = False,
     start: Annotated[
@@ -130,9 +133,10 @@ def get_conversation(
         Field(description="at most this many messages; omit to fill a page", ge=1),
     ] = None,
 ) -> dict:
-    """Loads one stored conversation. full=false gives the summary. full=true gives the
-    verbatim messages one page at a time — about 20,000 characters, from `start` forward
-    or, without `start`, the most recent ones — so a short conversation comes back whole.
+    """Loads one stored conversation. On its own it gives the summary. full=true, `start`
+    or `count` adds the verbatim messages one page at a time — about 20,000 characters,
+    from `start` forward or, without `start`, the most recent ones — so a short
+    conversation comes back whole.
     `showing` is the range returned and `message_count` the total; continue with
     `next_start` or `prev_start`. A single message longer than a page comes back cut,
     marked `truncated`. Each message carries `at`, when it was sent (null where the
@@ -143,7 +147,7 @@ def get_conversation(
             f"'{conversation_key}' not found. Check the key with list_conversations."
         )
     total = conversation["message_count"]
-    if full or not conversation.get("summary"):
+    if full or start is not None or count is not None or not conversation.get("summary"):
         page = db.conversation_page(conversation_key, PAGE_CHARS, start, count)
         if len(page) == 1 and len(page[0]["content"]) > PAGE_CHARS:  # over budget only when alone
             page[0] = {**page[0], "content": page[0]["content"][:PAGE_CHARS], "truncated": True}

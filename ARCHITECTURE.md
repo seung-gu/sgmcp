@@ -63,8 +63,8 @@ sequenceDiagram
     S-->>F: returns conversation_key
 
     loop after every answer
-        F->>S: append_messages (that key, latest turn verbatim)
-        S->>DB: append (identical resend ignored)
+        F->>S: append_messages (that key, unsaved turns verbatim)
+        S->>DB: append (messages already saved are stored once)
         S-)S: index new search passages (background)
     end
 
@@ -82,10 +82,13 @@ sequenceDiagram
 
     CC->>H: turn ends (transcript path on stdin)
     H->>H: extract conversation text from JSONL<br/>(tool output, internal logs and API error notices dropped)
-    H->>S: full upsert (cc-sessionUUID, token header)
+    H->>S: last 20 messages + their position (cc-sessionUUID, token header)
+    S->>DB: insert the ones not stored yet
+    S-->>H: 409 when the stored messages stop short of them or differ
+    H->>S: on 409, the whole session
     S->>DB: insert the new tail<br/>(rewrite all if the last 20 stored differ)
     S-)S: index new search passages (background)
-    Note over H,DB: full-state upsert every turn = any failure<br/>heals on the next turn; 100% verbatim
+    Note over H,DB: ~30 KB per turn however long the session;<br/>any failure heals on the next turn; 100% verbatim
 ```
 
 ## Refresh-groups workflow
@@ -187,7 +190,7 @@ to fill them from — Claude Code deletes transcripts after `cleanupPeriodDays`.
 |---|---|---|
 | Canonical (immutable) | `conversation_key` `source` `project`, and `messages(conversation_id, idx, role, content, at)` — one row per message, `message_count` on the conversation | clients |
 | Derived — LLM | `title` `tags` (importance-ordered array) `summary` `tagged_embedding` (anchor) | refresh, drift-gated |
-| Derived — math | `embedding` (passage mean, length-weighted) `embedding_vec` (same, pgvector-typed) `embedded_message_count` `cluster_small/big(_label)` `px py pz` | refresh |
+| Derived — math | `embedding` (passage mean, length-weighted) `embedded_message_count` `cluster_small/big(_label)` `px py pz` | refresh |
 | Search index | `conversation_chunks(conversation_id, kind, chunk_index, vec, first_message, last_message)` + `chunked_message_count` `chunk_version` | each save (body passages, background) · refresh (cards, catch-up) |
 | Usage log | `recall_log(tool, args, result)` — a separate table | the MCP search and read tools |
 
@@ -242,5 +245,3 @@ projection.
   appear in groups or on the map
 - Meaning-search still misses roughly 3 in 10 first hits; most of those return a
   sibling conversation on the same topic rather than something unrelated
-- `embedding_vec` is kept in sync but nothing reads it yet — it is the column a
-  "conversations similar to this one" feature would use
