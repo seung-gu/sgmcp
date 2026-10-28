@@ -1,0 +1,46 @@
+services:
+  citus-coordinator:
+    build: ./coordinator
+    container_name: citus-coordinator
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password1234
+      POSTGRES_DB: fintech_dist_db
+      POSTGRES_HOST_AUTH_METHOD: trust
+    ports:
+      - "5434:5432"
+    command: >
+      postgres
+      -c shared_preload_libraries=citus,pg_cron
+      -c cron.database_name=fintech_dist_db
+    volumes:
+      - citus_coordinator_data:/var/lib/postgresql/data
+
+  citus-worker-1:
+    image: citusdata/citus:12.1
+    container_name: citus-worker-1
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password1234
+      POSTGRES_DB: fintech_dist_db
+      POSTGRES_HOST_AUTH_METHOD: trust
+    command: postgres -c shared_preload_libraries=citus
+    volumes:
+      - citus_worker_1_data:/var/lib/postgresql/data
+
+  citus-worker-2:
+    image: citusdata/citus:12.1
+    container_name: citus-worker-2
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password1234
+      POSTGRES_DB: fintech_dist_db
+      POSTGRES_HOST_AUTH_METHOD: trust
+    command: postgres -c shared_preload_libraries=citus
+    volumes:
+      - citus_worker_2_data:/var/lib/postgresql/data
+
+volumes:
+  citus_coordinator_data:
+  citus_worker_1_data:
+  citus_worker_2_data:
