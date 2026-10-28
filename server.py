@@ -9,6 +9,7 @@ from pydantic import BaseModel, Field
 
 import dashboard
 import db
+import grouping
 import ingest
 
 mcp = FastMCP(
@@ -127,8 +128,28 @@ def search_conversations(
     query: Annotated[str, Field(description="keyword to search in titles, summaries and content")],
     limit: Annotated[int, Field(description="maximum number to return", ge=1, le=50)] = 10,
 ) -> list[dict]:
-    """Searches stored conversations by keyword (title + summary + content, case-insensitive)."""
+    """Searches stored conversations by keyword (title + summary + content, case-insensitive).
+    For a topic whose exact wording you don't know, use search_conversations_by_meaning."""
     return db.search_conversations(query, limit)
+
+
+@mcp.tool()
+def search_conversations_by_meaning(
+    query: Annotated[
+        str, Field(description="what you are looking for, as a phrase or sentence; any language")
+    ],
+    limit: Annotated[int, Field(description="maximum number to return", ge=1, le=50)] = 10,
+) -> list[dict]:
+    """Searches stored conversations by meaning rather than spelling, closest first.
+    Use when you know the topic but not the exact words. The search index is updated
+    when the archive is refreshed, not on every save, so recently saved conversations
+    may be missing — for those, or for an exact name or term, use search_conversations."""
+    try:
+        return grouping.semantic_search(query, limit)
+    except Exception as e:  # missing API key, embedding call failed
+        raise ValueError(
+            f"Meaning search is unavailable ({e}). Use search_conversations instead."
+        ) from e
 
 
 dashboard.register(mcp)

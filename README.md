@@ -22,9 +22,17 @@ the archive and see the groups on a 3D map.
 - **Saving.** claude.ai (and ChatGPT, when connected) saves through MCP tools after
   every answer. Claude Code saves through a Stop hook that reads the local session
   transcript, so it spends no model tokens.
-- **Recalling.** Any connected assistant can call `search_conversations` to find
-  earlier conversations by keyword, then `get_conversation` to read one: the summary
+- **Recalling.** Any connected assistant can look up earlier conversations: by keyword
+  with `search_conversations`, or by topic with `search_conversations_by_meaning` when
+  it doesn't know the exact words. `get_conversation` then reads one: the summary
   first, the verbatim messages when it needs the details.
+- **Reopening.** Each conversation keeps a way back to the app it came from. Claude
+  Code stores a `cd <project> && claude --resume <session-id>` command, and claude.ai
+  stores the chat URL, which the assistant asks the user to paste. The dashboard shows
+  the URL as a link and the command with a copy button, and the archive tools return
+  it too, so a conversation found later can be continued where it started. The resume
+  command needs the session's local transcript, so it works on the machine that ran
+  the session.
 - **Storing.** One Postgres table holds the verbatim messages. Every other column is
   derived from them and can be rebuilt.
 - **Deriving.** The dashboard's "Refresh groups" button embeds new messages and checks
@@ -43,10 +51,11 @@ measurements behind each tuned value.
 | Tool | What it does |
 |---|---|
 | `save_conversation(messages, source?, project?, key?)` | Create a conversation (the server issues a `cw-`+UUID key when none is given), or overwrite one to repair it |
-| `append_messages(key, new_messages, project?)` | Append the latest turn; an identical resend is ignored |
+| `append_messages(key, new_messages, project?, source_url?)` | Append the latest turn; an identical resend is ignored. `source_url` stores the chat's address for reopening |
 | `get_conversation(key, full=False)` | Load one conversation, summary first; `full=true` adds the verbatim messages |
 | `list_conversations(limit)` | Recent conversations, without message bodies |
 | `search_conversations(query, limit)` | Keyword search over title, summary and content |
+| `search_conversations_by_meaning(query, limit)` | Meaning search for a topic whose exact words are unknown; covers conversations up to the last "Refresh groups" |
 
 ## Tech Stack
 
@@ -87,7 +96,7 @@ curl -X POST http://localhost:8000/mcp \
 | `DATABASE_URL` | Postgres connection string (e.g. Neon). Needed by the archive tools and the dashboard |
 | `DASHBOARD_TOKEN` | Dashboard access token. The dashboard is off when unset |
 | `INGEST_TOKEN` | Auth token for `POST /api/ingest`, used by the Claude Code hook |
-| `OPENAI_API_KEY` | Embeddings and metadata generation. List and search work without it |
+| `OPENAI_API_KEY` | Embeddings, meaning search and metadata generation. List and keyword search work without it |
 | `ARCHIVE_LANGUAGE` | Language of all derived text: titles, tags, summaries, group names (default: Korean) |
 
 ### Connecting a client
@@ -123,7 +132,6 @@ fly deploy --ha=false                                      # Fly.io; the schema 
 
 ## Future Ideas
 
-- [ ] Meaning search as an MCP tool, so assistants recall by topic and not only by keyword
 - [ ] Authentication on the `/mcp` endpoint
 - [ ] Split conversations that mix two topics, so each part lands in its own group
 - [ ] "Conversations similar to this one", using the vector column that is already kept in sync
