@@ -69,9 +69,10 @@ _SCHEMA = [
     "ALTER TABLE conversation_chunks ADD COLUMN IF NOT EXISTS last_message INT",
     # Which passage rule (grouping.CHUNK_VERSION) a conversation's passages were cut by.
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS chunk_version INT NOT NULL DEFAULT 1",
-    # One row per message, replacing the `messages` array: appending a turn then writes
-    # a few rows instead of rewriting the whole array (2.7 MB, ~2 s for the largest
-    # conversation). Filled alongside the array until reads switch over.
+    # One row per message, replacing the `messages` array: appending a turn writes a
+    # few rows instead of rewriting the whole array (2.7 MB, ~2 s for the largest
+    # conversation). The array column is no longer written or read; it stays, frozen,
+    # until it is dropped.
     """
     CREATE TABLE IF NOT EXISTS messages (
         conversation_id BIGINT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
@@ -180,39 +181,33 @@ def save_conversation(
     growth keeps them, so incremental embedding picks up from where it left off
     (an overwrite that keeps or grows the count doesn't waste a re-embed).
 
-    In the messages table, `replace` rewrites every row (an explicit repair);
-    otherwise only the new tail is written (see _sync_messages)."""
+    The messages go to the messages table: `replace` rewrites every row (an explicit
+    repair); otherwise only the new tail is written (see _sync_messages)."""
     with _connect() as conn:
         row = conn.execute(
             """
             INSERT INTO conversations (conversation_key, title, messages, source, project, source_url)
-            VALUES (%s, '', %s, %s, %s, %s)
+            VALUES (%(key)s, '', '[]'::jsonb, %(source)s, %(project)s, %(url)s)
             ON CONFLICT (conversation_key) DO UPDATE
-                SET messages = EXCLUDED.messages,
-                    source = EXCLUDED.source,
+                SET source = EXCLUDED.source,
                     project = CASE WHEN EXCLUDED.project <> '' THEN EXCLUDED.project
                                    ELSE conversations.project END,
                     source_url = CASE WHEN EXCLUDED.source_url <> '' THEN EXCLUDED.source_url
                                       ELSE conversations.source_url END,
-                    embedding = CASE WHEN jsonb_array_length(EXCLUDED.messages)
-                                          < conversations.embedded_message_count
+                    embedding = CASE WHEN %(count)s < conversations.embedded_message_count
                                      THEN NULL ELSE conversations.embedding END,
-                    embedding_vec = CASE WHEN jsonb_array_length(EXCLUDED.messages)
-                                              < conversations.embedded_message_count
+                    embedding_vec = CASE WHEN %(count)s < conversations.embedded_message_count
                                          THEN NULL ELSE conversations.embedding_vec END,
-                    embedded_message_count = CASE WHEN jsonb_array_length(EXCLUDED.messages)
-                                                       < conversations.embedded_message_count
+                    embedded_message_count = CASE WHEN %(count)s < conversations.embedded_message_count
                                                   THEN 0 ELSE conversations.embedded_message_count END,
-                    embedded_vector_count = CASE WHEN jsonb_array_length(EXCLUDED.messages)
-                                                      < conversations.embedded_message_count
+                    embedded_vector_count = CASE WHEN %(count)s < conversations.embedded_message_count
                                                  THEN 0 ELSE conversations.embedded_vector_count END,
-                    tagged_embedding = CASE WHEN jsonb_array_length(EXCLUDED.messages)
-                                                 < conversations.embedded_message_count
+                    tagged_embedding = CASE WHEN %(count)s < conversations.embedded_message_count
                                             THEN NULL ELSE conversations.tagged_embedding END,
                     updated_at = now()
             RETURNING id, (created_at = updated_at) AS is_new
             """,
-            (key, Jsonb(messages), source, project, source_url),
+            {"key": key, "source": source, "project": project, "url": source_url, "count": len(messages)},
         ).fetchone()
         _sync_messages(conn, row["id"], messages, replace)
     return {
@@ -227,35 +222,48 @@ def append_messages(
 ) -> dict | None:
     with _connect() as conn:
         row = conn.execute(
-            "SELECT id, messages, source_url FROM conversations WHERE conversation_key = %s FOR UPDATE",
+            """
+            SELECT id, coalesce(message_count, 0) AS message_count, source_url
+            FROM conversations WHERE conversation_key = %s FOR UPDATE
+            """,
             (key,),
         ).fetchone()
         if row is None:
             return None
-        current = row["messages"]
+        current = row["message_count"]
         n = len(new_messages)
+        tail = conn.execute(
+            "SELECT role, content FROM messages WHERE conversation_id = %s AND idx >= %s ORDER BY idx",
+            (row["id"], current - n),
+        ).fetchall()
         # duplicate guard: ignore a turn identical to the current tail (retry safety)
-        if n == 0 or current[-n:] == new_messages:
+        if n == 0 or [{"role": r["role"], "content": r["content"]} for r in tail] == new_messages:
             return {
                 "conversation_key": key,
                 "appended": 0,
-                "total_messages": len(current),
+                "total_messages": current,
                 "note": "duplicate turn — skipped",
             }
-        updated = conn.execute(
+        with conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO messages (conversation_id, idx, role, content) VALUES (%s, %s, %s, %s)",
+                [
+                    (row["id"], current + i, m.get("role", ""), m.get("content", ""))
+                    for i, m in enumerate(new_messages)
+                ],
+            )
+        total = current + n
+        conn.execute(
             """
             UPDATE conversations
-            SET messages = messages || %s,
+            SET message_count = %s,
                 project = CASE WHEN %s <> '' THEN %s ELSE project END,
                 source_url = CASE WHEN %s <> '' THEN %s ELSE source_url END,
                 updated_at = now()
-            WHERE conversation_key = %s
-            RETURNING jsonb_array_length(messages) AS total
+            WHERE id = %s
             """,
-            (Jsonb(new_messages), project, project, source_url, source_url, key),
-        ).fetchone()
-        _sync_messages(conn, row["id"], current + new_messages, replace=False)
-    total = updated["total"]
+            (total, project, project, source_url, source_url, row["id"]),
+        )
     has_url = bool(row["source_url"] or source_url)
     result = {"conversation_key": key, "appended": n, "total_messages": total}
     # periodically nudge the model to ask the user for this conversation's URL
@@ -264,12 +272,21 @@ def append_messages(
     return result
 
 
+# A conversation's messages as an ordered JSON list built from the messages table —
+# the shape every caller already handles. Correlated on an unaliased `conversations`.
+_MESSAGES_OF = """(
+    SELECT coalesce(jsonb_agg(jsonb_build_object('role', m.role, 'content', m.content)
+                              ORDER BY m.idx), '[]'::jsonb)
+    FROM messages m WHERE m.conversation_id = conversations.id
+)"""
+
+
 def get_conversation(key: str) -> dict | None:
     with _connect() as conn:
         row = conn.execute(
-            """
+            f"""
             SELECT conversation_key, title, source, source_url, tags, project, summary,
-                   messages, created_at, updated_at
+                   {_MESSAGES_OF} AS messages, created_at, updated_at
             FROM conversations
             WHERE conversation_key = %s
             """,
@@ -280,7 +297,7 @@ def get_conversation(key: str) -> dict | None:
 
 _LIST_COLUMNS = """
     conversation_key, title, source, source_url, tags, project, summary,
-    jsonb_array_length(messages) AS message_count,
+    coalesce(message_count, 0) AS message_count,
     created_at, updated_at
 """
 
@@ -305,7 +322,9 @@ def conversation_overview(key: str) -> dict | None:
     with _connect() as conn:
         row = conn.execute(
             f"""
-            SELECT {_LIST_COLUMNS}, char_length(messages::text) AS chars
+            SELECT {_LIST_COLUMNS},
+                   (SELECT coalesce(sum(char_length(content)), 0) FROM messages
+                    WHERE conversation_id = conversations.id) AS chars
             FROM conversations
             WHERE conversation_key = %s
             """,
@@ -315,17 +334,18 @@ def conversation_overview(key: str) -> dict | None:
 
 
 def conversation_messages(key: str, start: int, stop: int) -> list[dict]:
-    """messages[start:stop], sliced in the database so a long conversation never
-    travels whole."""
+    """messages[start:stop], read by index range so a long conversation never travels
+    whole."""
     with _connect() as conn:
         return conn.execute(
             """
-            SELECT coalesce(jsonb_agg(t.m ORDER BY t.i), '[]'::jsonb) AS messages
-            FROM conversations c, jsonb_array_elements(c.messages) WITH ORDINALITY t(m, i)
-            WHERE c.conversation_key = %s AND t.i > %s AND t.i <= %s
+            SELECT m.role, m.content
+            FROM messages m JOIN conversations c ON c.id = m.conversation_id
+            WHERE c.conversation_key = %s AND m.idx >= %s AND m.idx < %s
+            ORDER BY m.idx
             """,
             (key, start, stop),
-        ).fetchone()["messages"]
+        ).fetchall()
 
 
 def log_recall(tool: str, args: dict, result: dict) -> None:
@@ -343,9 +363,10 @@ def messages_at(spots: list[tuple[str, int]]) -> dict[tuple[str, int], str]:
     with _connect() as conn:
         rows = conn.execute(
             """
-            SELECT s.key, s.idx, c.messages -> s.idx ->> 'content' AS content
+            SELECT s.key, s.idx, m.content
             FROM unnest(%s::text[], %s::int[]) AS s(key, idx)
             JOIN conversations c ON c.conversation_key = s.key
+            JOIN messages m ON m.conversation_id = c.id AND m.idx = s.idx
             """,
             ([key for key, _ in spots], [idx for _, idx in spots]),
         ).fetchall()
@@ -388,17 +409,19 @@ def search_conversations(query: str, limit: int) -> list[dict]:
             f"""
             SELECT {_LIST_COLUMNS}
             FROM conversations
-            WHERE title ILIKE %s OR summary ILIKE %s OR messages::text ILIKE %s
+            WHERE title ILIKE %(pat)s OR summary ILIKE %(pat)s
+               OR EXISTS (SELECT 1 FROM messages m
+                          WHERE m.conversation_id = conversations.id AND m.content ILIKE %(pat)s)
             ORDER BY updated_at DESC
-            LIMIT %s
+            LIMIT %(limit)s
             """,
-            (pattern, pattern, pattern, limit),
+            {"pat": pattern, "limit": limit},
         ).fetchall()
         hits = conn.execute(
             """
-            SELECT c.conversation_key AS key, t.i - 1 AS idx
-            FROM conversations c, jsonb_array_elements(c.messages) WITH ORDINALITY t(m, i)
-            WHERE c.conversation_key = ANY(%s) AND t.m->>'content' ILIKE %s
+            SELECT c.conversation_key AS key, m.idx
+            FROM messages m JOIN conversations c ON c.id = m.conversation_id
+            WHERE c.conversation_key = ANY(%s) AND m.content ILIKE %s
             ORDER BY 1, 2
             """,
             ([row["conversation_key"] for row in rows], pattern),
@@ -480,10 +503,11 @@ def rows_needing_embedding() -> list[dict]:
     """Conversations with messages not yet folded into their embedding."""
     with _connect() as conn:
         return conn.execute(
-            """
-            SELECT id, messages, embedding, embedded_message_count, embedded_vector_count
+            f"""
+            SELECT id, {_MESSAGES_OF} AS messages, embedding, embedded_message_count,
+                   embedded_vector_count
             FROM conversations
-            WHERE embedded_message_count < jsonb_array_length(messages)
+            WHERE embedded_message_count < coalesce(message_count, 0)
             ORDER BY id
             """
         ).fetchall()
@@ -518,7 +542,8 @@ def all_embedded(drift_min_cos: float) -> list[dict]:
             """
             SELECT id, conversation_key, title, tags, summary,
                    cluster_small, cluster_small_label, cluster_big_label,
-                   left(messages->0->>'content', 200) AS sample,
+                   (SELECT left(content, 200) FROM messages
+                    WHERE conversation_id = conversations.id AND idx = 0) AS sample,
                    (tagged_embedding IS NULL
                     OR (embedding::vector <=> tagged_embedding::vector) > %s) AS drifted
             FROM conversations
@@ -548,12 +573,12 @@ def rows_needing_chunks(version: int, key: str | None = None) -> list[dict]:
     conversation."""
     with _connect() as conn:
         return conn.execute(
-            """
-            SELECT id, messages, chunked_message_count, chunk_version,
+            f"""
+            SELECT id, {_MESSAGES_OF} AS messages, chunked_message_count, chunk_version,
                    (SELECT count(*) FROM conversation_chunks
                     WHERE conversation_id = conversations.id AND kind = 'body') AS body_chunks
             FROM conversations
-            WHERE (chunked_message_count <> jsonb_array_length(messages)
+            WHERE (chunked_message_count <> coalesce(message_count, 0)
                    OR chunk_version <> %(version)s
                    OR EXISTS (SELECT 1 FROM conversation_chunks
                               WHERE conversation_id = conversations.id AND kind = 'body'
@@ -681,7 +706,7 @@ def messages_excerpt(row_id: int, segments: int = 20) -> list[dict]:
     the whole conversation in chronological order."""
     with _connect() as conn:
         row = conn.execute(
-            "SELECT messages FROM conversations WHERE id = %s", (row_id,)
+            f"SELECT {_MESSAGES_OF} AS messages FROM conversations WHERE id = %s", (row_id,)
         ).fetchone()
     messages = row["messages"]
     if len(messages) <= segments * 2:

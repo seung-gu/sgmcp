@@ -34,8 +34,9 @@ the archive and see the groups on a 3D map.
   it too, so a conversation found later can be continued where it started. The resume
   command needs the session's local transcript, so it works on the machine that ran
   the session.
-- **Storing.** One Postgres table holds the verbatim messages. Every other column is
-  derived from them and can be rebuilt.
+- **Storing.** The verbatim messages live in Postgres, one row per message, so saving
+  a turn writes only the new rows. Every other column is derived from them and can
+  be rebuilt.
 - **Deriving.** The dashboard's "Refresh groups" button embeds new messages and checks
   which conversations have drifted from their last summary. Only those get new titles,
   tags and summaries from the LLM; with no drift, a refresh makes no LLM calls.
