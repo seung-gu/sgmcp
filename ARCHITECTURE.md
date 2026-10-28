@@ -34,6 +34,8 @@ graph LR
     D --> R
     R <--> DB
     R -- "only what drifted" --> O
+    M -- "new search passages" --> O
+    I -- "new search passages" --> O
 ```
 
 One line per component:
@@ -41,7 +43,7 @@ One line per component:
 | Component | Role |
 |---|---|
 | Clients | **pipes** — they push verbatim text under a key, nothing else. No judgment |
-| Server (refresh) | all derivation — titles/tags/summaries, embeddings, groups, coordinates |
+| Server | after each save: index that conversation's new search passages, in the background. On refresh: all other derivation — titles/tags/summaries, embeddings, groups, coordinates |
 | Neon | the only store. Only `messages` is canonical; everything else is recomputable |
 | OpenAI | embeddings (text-embedding-3-small), generation/naming (gpt-4.1-mini via pydantic-ai, schema + language guardrails with retry) |
 
@@ -63,6 +65,7 @@ sequenceDiagram
     loop after every answer
         F->>S: append_messages (that key, latest turn verbatim)
         S->>DB: append (identical resend ignored)
+        S-)S: index new search passages (background)
     end
 
     Note over F,S: lost key → recover via list_conversations<br/>invented keys are rejected with guidance
@@ -81,19 +84,21 @@ sequenceDiagram
     H->>H: extract conversation text from JSONL<br/>(tool output and internal logs dropped)
     H->>S: full upsert (cc-sessionUUID, token header)
     S->>DB: replace wholesale
+    S-)S: index new search passages (background)
     Note over H,DB: full-state upsert every turn = any failure<br/>heals on the next turn; 100% verbatim
 ```
 
 ## Refresh-groups workflow
 
-The dashboard button is the only derivation trigger; save paths only store. 🤖 marks
+Apart from search passages, which every save indexes on its own (see Search), the
+dashboard button is the only derivation trigger. 🤖 marks
 an LLM call — with N drifted conversations a refresh makes **N + 2** calls, with
 zero drift it makes **none**.
 
 ```mermaid
 flowchart TD
     S([Refresh groups]) --> E["embed new messages only<br/>skip under 30 chars · length-weighted mean"]
-    E --> C["re-index search passages of conversations that gained messages<br/>(ahead of the gate — new text must be findable even without drift)"]
+    E --> C["catch up search passages still behind<br/>(saves index their own; this repairs failed runs · ahead of the gate)"]
     C --> G{"drift check<br/>no anchor, or cosine below 0.99"}
     G -- "none" --> X(["done — groups, names, coordinates all kept<br/>zero LLM calls"])
     G -- "one or more" --> M["🤖 regenerate drifted conversations only<br/>sample of 40 → title · tags (importance-ordered) · summary<br/>anchor moves to the current vector · stale search card dropped"]
@@ -114,7 +119,9 @@ assistant message from each (max 40 messages, 400 chars each).
 
 Two modes share one box. **Text** is literal (`ILIKE` over title, summary and raw
 messages) — right for an exact string like an error message. **Meaning** embeds the
-query and ranks by cosine distance, served by an HNSW index in pgvector.
+query and ranks by cosine distance, served by an HNSW index in pgvector. Assistants
+get the same two modes as MCP tools, `search_conversations` and
+`search_conversations_by_meaning`.
 
 Meaning-search deliberately does *not* use the conversation's average vector. An
 average answers "what is this conversation about overall", which is what clustering
@@ -123,7 +130,17 @@ unrelated queries. Instead each conversation is cut into ~1500-character passage
 plus one card of `title + summary + tags`, and a conversation scores as its single
 best-matching passage — "does this conversation contain what I'm asking about".
 
-Passages are re-indexed when a conversation gains messages, ahead of the drift gate.
+Passages are indexed right after every save. The save tools and `/api/ingest` queue
+the conversation on a single background worker, so a save never waits on OpenAI and
+saves never index the same conversation twice at once. Passages are cut in message
+order, so appended messages can only change the last passage and add new ones; only
+those are embedded — one passage per turn, where rebuilding the largest conversation
+from scratch takes 606. Embedding runs outside any lock, so before writing, the job
+locks the row and checks that `chunked_message_count` is still the value it started
+from; if a refresh got there first, it writes nothing. A failed run leaves the counter
+behind, so the next save or the refresh's catch-up step finishes the job. A
+conversation that shrank was rewritten, and starts over.
+
 Cards follow a delete-and-rebuild rule: anything that changes their input text
 (metadata regeneration, the tag merge) deletes the card row in the same transaction,
 and a later pass rebuilds every missing card. A missing card is self-healing — the
@@ -137,7 +154,7 @@ the anchor has already moved and drift will never fire for it again.
 | Canonical (immutable) | `conversation_key` `messages` `source` `project` | clients |
 | Derived — LLM | `title` `tags` (importance-ordered array) `summary` `tagged_embedding` (anchor) | refresh, drift-gated |
 | Derived — math | `embedding` (weighted mean) `embedding_vec` (same, pgvector-typed) `embedded_*_count` `cluster_small/big(_label)` `px py pz` | refresh |
-| Search index | `conversation_chunks(conversation_id, kind, chunk_index, vec)` + `chunked_message_count` | refresh |
+| Search index | `conversation_chunks(conversation_id, kind, chunk_index, vec)` + `chunked_message_count` | each save (body passages, background) · refresh (cards, catch-up) |
 
 Drift is evaluated in SQL (`embedding <=> tagged_embedding`), so the metadata phase
 never carries vectors in memory — they are loaded only for clustering and the 3D

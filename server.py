@@ -47,7 +47,9 @@ def save_conversation(
     response for all later append_messages calls. Title, tags and summary are
     generated server-side — do not send them."""
     key = conversation_key or f"cw-{uuid.uuid4()}"
-    return db.save_conversation(key, [m.model_dump() for m in messages], source, project)
+    result = db.save_conversation(key, [m.model_dump() for m in messages], source, project)
+    grouping.index_soon(key)
+    return result
 
 
 @mcp.tool()
@@ -90,6 +92,7 @@ def append_messages(
             "call list_conversations to find the most recent conversation and use its "
             "conversation_key. Never invent keys."
         )
+    grouping.index_soon(conversation_key)
     return result
 
 
@@ -141,9 +144,9 @@ def search_conversations_by_meaning(
     limit: Annotated[int, Field(description="maximum number to return", ge=1, le=50)] = 10,
 ) -> list[dict]:
     """Searches stored conversations by meaning rather than spelling, closest first.
-    Use when you know the topic but not the exact words. The search index is updated
-    when the archive is refreshed, not on every save, so recently saved conversations
-    may be missing — for those, or for an exact name or term, use search_conversations."""
+    Use when you know the topic but not the exact words; for an exact name or term,
+    use search_conversations. New messages become searchable a few seconds after
+    they are saved."""
     try:
         return grouping.semantic_search(query, limit)
     except Exception as e:  # missing API key, embedding call failed

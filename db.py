@@ -338,16 +338,22 @@ def embeddings_by_id() -> dict[int, list[float]]:
         }
 
 
-def rows_needing_chunks() -> list[dict]:
-    """Conversations whose search passages are missing or behind the message list."""
+def rows_needing_chunks(key: str | None = None) -> list[dict]:
+    """Conversations whose search passages are missing or behind the message list,
+    with how far each was indexed — enough to embed only what changed. Pass `key`
+    to check a single conversation."""
     with _connect() as conn:
         return conn.execute(
             """
-            SELECT id, messages
+            SELECT id, messages, chunked_message_count,
+                   (SELECT count(*) FROM conversation_chunks
+                    WHERE conversation_id = conversations.id AND kind = 'body') AS body_chunks
             FROM conversations
             WHERE chunked_message_count <> jsonb_array_length(messages)
+              AND (%(key)s::text IS NULL OR conversation_key = %(key)s)
             ORDER BY id
-            """
+            """,
+            {"key": key},
         ).fetchall()
 
 
@@ -369,23 +375,38 @@ def rows_needing_card() -> list[dict]:
         ).fetchall()
 
 
-def replace_body_chunks(row_id: int, vectors: list[list[float]], message_count: int) -> None:
-    """Swap in a fresh set of body passages for one conversation."""
+def replace_body_chunks(
+    row_id: int, start: int, vectors: list[list[float]], message_count: int, indexed_count: int
+) -> bool:
+    """Swap in body passages from chunk `start` on, keeping the ones before it.
+
+    The vectors were embedded outside any lock, from the state where `indexed_count`
+    messages were indexed. If another run (a refresh, or the indexing after a save)
+    has moved the counter since, nothing is written; whatever is still missing is
+    picked up by the next save or refresh."""
     with _connect() as conn:
-        conn.execute(
-            "DELETE FROM conversation_chunks WHERE conversation_id = %s AND kind = 'body'",
+        row = conn.execute(
+            "SELECT chunked_message_count FROM conversations WHERE id = %s FOR UPDATE",
             (row_id,),
+        ).fetchone()
+        if row is None or row["chunked_message_count"] != indexed_count:
+            return False
+        conn.execute(
+            "DELETE FROM conversation_chunks"
+            " WHERE conversation_id = %s AND kind = 'body' AND chunk_index >= %s",
+            (row_id, start),
         )
         with conn.cursor() as cur:
             cur.executemany(
                 "INSERT INTO conversation_chunks (conversation_id, kind, chunk_index, vec)"
                 " VALUES (%s, 'body', %s, %s::vector)",
-                [(row_id, i, _vector_literal(v)) for i, v in enumerate(vectors)],
+                [(row_id, start + i, _vector_literal(v)) for i, v in enumerate(vectors)],
             )
         conn.execute(
             "UPDATE conversations SET chunked_message_count = %s WHERE id = %s",
             (message_count, row_id),
         )
+    return True
 
 
 def replace_card_chunk(row_id: int, vector: list[float]) -> None:

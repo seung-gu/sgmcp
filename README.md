@@ -39,9 +39,11 @@ the archive and see the groups on a 3D map.
   which conversations have drifted from their last summary. Only those get new titles,
   tags and summaries from the LLM; with no drift, a refresh makes no LLM calls.
   Clustering then groups conversations by topic, and PCA places them on the 3D map.
-- **Searching on the dashboard.** Text search matches exact strings, such as an error
-  message. Meaning search cuts each conversation into ~1,500-character passages and
-  ranks a conversation by its best-matching passage.
+- **Searching.** Text search matches exact strings, such as an error message. Meaning
+  search cuts each conversation into ~1,500-character passages and ranks a
+  conversation by its best-matching passage. The server indexes new messages in the
+  background right after each save; passages are cut in message order, so only the
+  last passage and any new ones are embedded.
 
 [ARCHITECTURE.md](ARCHITECTURE.md) has the diagrams, the data model and the
 measurements behind each tuned value.
@@ -55,7 +57,7 @@ measurements behind each tuned value.
 | `get_conversation(key, full=False)` | Load one conversation, summary first; `full=true` adds the verbatim messages |
 | `list_conversations(limit)` | Recent conversations, without message bodies |
 | `search_conversations(query, limit)` | Keyword search over title, summary and content |
-| `search_conversations_by_meaning(query, limit)` | Meaning search for a topic whose exact words are unknown; covers conversations up to the last "Refresh groups" |
+| `search_conversations_by_meaning(query, limit)` | Meaning search for a topic whose exact words are unknown; new messages become searchable seconds after they are saved |
 
 ## Tech Stack
 

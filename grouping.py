@@ -3,10 +3,12 @@
 # Also hosts semantic search, which shares the embedding call.
 
 import json
+import logging
 import os
 import re
 import time
 from collections import Counter
+from concurrent.futures import ThreadPoolExecutor
 from functools import cache
 
 import httpx
@@ -95,16 +97,48 @@ def _card(title: str, tags: list[str], summary: str) -> str:
     return f"{title}. {summary} {' '.join(tags or [])}"
 
 
+def _index_body_chunks(row: dict) -> int:
+    """Bring one conversation's search passages up to date, embedding only what changed.
+
+    Passages are cut in message order, so appended messages can only change the last
+    passage (it may have been partial) and add new ones after it; every earlier
+    passage stays identical. A message list shorter than what was indexed means the
+    conversation was rewritten, so that case starts over — the same rule
+    db.save_conversation applies to the mean vector."""
+    messages = row["messages"]
+    rewritten = len(messages) < row["chunked_message_count"]
+    start = 0 if rewritten else max(row["body_chunks"] - 1, 0)
+    passages = _passages(messages)[start:]
+    vectors = _embed_texts(passages) if passages else []
+    db.replace_body_chunks(row["id"], start, vectors, len(messages), row["chunked_message_count"])
+    return len(vectors)
+
+
+# One worker: saves arrive every turn, and indexing them one at a time keeps two
+# jobs off the same conversation and memory flat on the small machine.
+_indexer = ThreadPoolExecutor(max_workers=1)
+
+
+def index_soon(key: str) -> None:
+    """Queue one conversation's search passages for indexing, off the request path,
+    so a save never waits on — or fails because of — the embedding call. A failed
+    run leaves chunked_message_count where it was, so the next save retries it."""
+    if os.environ.get("OPENAI_API_KEY"):
+        _indexer.submit(_index_conversation, key)
+
+
+def _index_conversation(key: str) -> None:
+    try:
+        for row in db.rows_needing_chunks(key):
+            _index_body_chunks(row)
+    except Exception:
+        logging.getLogger(__name__).exception("indexing %s failed; the next save retries", key)
+
+
 def _refresh_body_chunks() -> int:
-    """Re-embed search passages for conversations that gained messages. The counter
+    """Index search passages for every conversation that gained messages. The counter
     starts at zero, so the first run indexes the whole archive."""
-    rebuilt = 0
-    for row in db.rows_needing_chunks():
-        passages = _passages(row["messages"])
-        vectors = _embed_texts(passages) if passages else []
-        db.replace_body_chunks(row["id"], vectors, len(row["messages"]))
-        rebuilt += len(vectors)
-    return rebuilt
+    return sum(_index_body_chunks(row) for row in db.rows_needing_chunks())
 
 
 def _refresh_cards() -> int:

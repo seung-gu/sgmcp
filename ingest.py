@@ -8,6 +8,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 
 import db
+import grouping
 
 
 def _authorized(request: Request) -> bool:
@@ -35,4 +36,5 @@ def register(mcp) -> None:
             )
         except KeyError as e:
             return JSONResponse({"error": f"missing field: {e}"}, status_code=400)
+        grouping.index_soon(body["conversation_key"])
         return JSONResponse(result)
