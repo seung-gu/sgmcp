@@ -8,4 +8,5 @@ dependencies = [
     "numpy>=2.5.1",
     "psycopg[binary]>=3.3.4",
     "pydantic-ai-slim[openai]>=2.9.1",
+    "scipy>=1.18.1",
 ]

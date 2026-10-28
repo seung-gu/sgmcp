@@ -14,6 +14,7 @@ import httpx
 import numpy as np
 from pydantic import BaseModel, Field, create_model
 from pydantic_ai import Agent, ModelRetry
+from scipy.cluster.hierarchy import fcluster, linkage
 
 import db
 
@@ -553,28 +554,17 @@ def _center_by_language(matrix: np.ndarray, rows: list[dict]) -> np.ndarray:
 
 
 def _agglomerate(vectors: np.ndarray, threshold: float) -> list[list[int]]:
-    """Repeatedly merge the two clusters whose members are most alike on average
-    (average linkage) until that average cosine drops below the threshold. Returns
-    member-index lists. A merged cluster's similarity to any other is the
-    size-weighted mean of its two parts' (Lance–Williams), so each merge updates one
-    row instead of recomputing all pairs."""
-    unit = vectors / (np.linalg.norm(vectors, axis=1, keepdims=True) + 1e-9)
-    sim = unit @ unit.T
-    np.fill_diagonal(sim, -np.inf)
-    sizes = np.ones(len(vectors))
-    members = [[i] for i in range(len(vectors))]
-    while len(vectors) > 1:
-        i, j = divmod(int(sim.argmax()), sim.shape[1])
-        if sim[i, j] < threshold:
-            break
-        merged = (sizes[i] * sim[i] + sizes[j] * sim[j]) / (sizes[i] + sizes[j])
-        sim[i], sim[:, i] = merged, merged
-        sim[j], sim[:, j] = -np.inf, -np.inf
-        sim[i, i] = -np.inf
-        sizes[i] += sizes[j]
-        members[i] += members[j]
-        members[j] = []
-    return [m for m in members if m]
+    """Average linkage: keep merging the two clusters whose members are most alike on
+    average while that average cosine stays at or above `threshold` — in distance
+    terms, cut the tree at 1 - threshold. Returns member-index lists."""
+    if len(vectors) < 2:
+        return [[i] for i in range(len(vectors))]
+    tree = linkage(vectors, method="average", metric="cosine")
+    labels = fcluster(tree, t=1 - threshold, criterion="distance")
+    clusters: dict[int, list[int]] = {}
+    for i, label in enumerate(labels):
+        clusters.setdefault(label, []).append(i)
+    return list(clusters.values())
 
 
 def _pca3(vectors: np.ndarray) -> np.ndarray:
