@@ -279,7 +279,7 @@ async function refreshGroups() {
   btn.disabled = true; st.textContent = 'Recomputing…';
   try {
     const r = await api('/api/refresh', { method: 'POST' });
-    st.textContent = r.skipped ? 'No changes — groups kept' : `Embedded ${r.embedded} · regenerated ${r.metadata_generated} · big ${r.clusters_big} · small ${r.clusters_small}`;
+    st.textContent = r.skipped ? 'No changes — groups kept' : `Means updated ${r.embedded} · regenerated ${r.metadata_generated} · big ${r.clusters_big} · small ${r.clusters_small}`;
     await load();
   } catch (err) { st.textContent = '⚠ ' + err.message; }
   btn.disabled = false;

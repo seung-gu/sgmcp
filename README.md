@@ -37,8 +37,9 @@ the archive and see the groups on a 3D map.
 - **Storing.** The verbatim messages live in Postgres, one row per message, so saving
   a turn writes only the new rows. Every other column is derived from them and can
   be rebuilt.
-- **Deriving.** The dashboard's "Refresh groups" button embeds new messages and checks
-  which conversations have drifted from their last summary. Only those get new titles,
+- **Deriving.** The dashboard's "Refresh groups" button averages each conversation's
+  search passages into one vector (weighted by length, no new embedding calls) and
+  checks which conversations have drifted from their last summary. Only those get new titles,
   tags and summaries from the LLM; with no drift, a refresh makes no LLM calls.
   Clustering then groups conversations by topic, and PCA places them on the 3D map.
 - **Searching.** Text search matches exact strings, such as an error message. Meaning

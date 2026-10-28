@@ -97,9 +97,9 @@ zero drift it makes **none**.
 
 ```mermaid
 flowchart TD
-    S([Refresh groups]) --> E["embed new messages only<br/>skip under 30 chars · length-weighted mean"]
-    E --> C["catch up search passages still behind<br/>(saves index their own; this repairs failed runs · ahead of the gate)"]
-    C --> G{"drift check<br/>no anchor, or cosine below 0.99"}
+    S([Refresh groups]) --> C["catch up search passages still behind<br/>(saves index their own; this repairs failed runs · ahead of the gate)"]
+    C --> E["mean vector = the passages' average, weighted by own length<br/>no embedding calls · skips conversations whose passages didn't move"]
+    E --> G{"drift check<br/>no anchor, or cosine below 0.99"}
     G -- "none" --> X(["done — groups, names, coordinates all kept<br/>zero LLM calls"])
     G -- "one or more" --> M["🤖 regenerate drifted conversations only<br/>sample of 40 → title · tags (importance-ordered) · summary<br/>anchor moves to the current vector · stale search card dropped"]
     M --> T["🤖 tag merge — one global call<br/>unify same topic, different spellings<br/>retagged conversations drop their card too"]
@@ -187,7 +187,7 @@ to fill them from — Claude Code deletes transcripts after `cleanupPeriodDays`.
 |---|---|---|
 | Canonical (immutable) | `conversation_key` `source` `project`, and `messages(conversation_id, idx, role, content, at)` — one row per message, `message_count` on the conversation | clients |
 | Derived — LLM | `title` `tags` (importance-ordered array) `summary` `tagged_embedding` (anchor) | refresh, drift-gated |
-| Derived — math | `embedding` (weighted mean) `embedding_vec` (same, pgvector-typed) `embedded_*_count` `cluster_small/big(_label)` `px py pz` | refresh |
+| Derived — math | `embedding` (passage mean, length-weighted) `embedding_vec` (same, pgvector-typed) `embedded_message_count` `cluster_small/big(_label)` `px py pz` | refresh |
 | Search index | `conversation_chunks(conversation_id, kind, chunk_index, vec, first_message, last_message)` + `chunked_message_count` `chunk_version` | each save (body passages, background) · refresh (cards, catch-up) |
 | Usage log | `recall_log(tool, args, result)` — a separate table | the MCP search and read tools |
 

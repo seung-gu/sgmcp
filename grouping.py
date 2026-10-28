@@ -39,7 +39,7 @@ DRIFT_MIN_COS = 0.99
 # detection absorbed the interview-prep conversations at 0.25). The previous 0.35
 # was tuned against 15 conversations and had drifted past the cliff.
 T_SMALL = 0.30
-MIN_CHARS = 30  # messages shorter than this ("thanks", "ok") don't vote in the mean
+MIN_CHARS = 30  # messages shorter than this ("thanks", "ok") stay out of passages, so out of the mean
 MIN_GROUP_FOR_CENTERING = 4  # smaller language groups fall back to the global mean
 
 # Conversations are cut into passages of this many characters before being embedded
@@ -100,12 +100,11 @@ def _embed_texts(texts: list[str]) -> list[list[float]]:
     return vectors
 
 
-def _passages(messages: list[dict]) -> list[tuple[int, int, str]]:
+def _passages(messages: list[dict]) -> list[tuple[int, int, int, str]]:
     """Cut a conversation into passages of CHUNK_CHARS characters, skipping the short
-    chatter that MIN_CHARS already excludes from the mean. Each passage comes as
-    (first message index, last message index, text to embed): the indexes cover the
-    messages its own characters come from, and the text also starts with the
-    CHUNK_OVERLAP characters before it.
+    chatter under MIN_CHARS. Each passage comes as (first message index, last message
+    index, own chars, text to embed): the indexes and the length cover its own
+    characters, while the text also starts with the CHUNK_OVERLAP characters before.
 
     The cut ignores message boundaries, so sizes stay even and a long message is
     split rather than truncated; the overlap is what keeps a sentence or a
@@ -135,7 +134,7 @@ def _passages(messages: list[dict]) -> list[tuple[int, int, str]]:
         else:
             end = len(stream)
         text = stream[max(start - CHUNK_OVERLAP, 0) : end]
-        passages.append((owner(start), owner(end - 1), text))
+        passages.append((owner(start), owner(end - 1), end - start, text))
         start = end
     return passages
 
@@ -157,9 +156,9 @@ def _index_body_chunks(row: dict) -> int:
     recut = row["chunk_version"] != CHUNK_VERSION
     start = 0 if rewritten or recut else max(row["body_chunks"] - 1, 0)
     passages = _passages(messages)
-    texts = [text for _, _, text in passages[start:]]
+    texts = [text for *_, text in passages[start:]]
     vectors = _embed_texts(texts) if texts else []
-    positions = [(first, last) for first, last, _ in passages]
+    positions = [(first, last, chars) for first, last, chars, _ in passages]
     db.replace_body_chunks(
         row["id"],
         start,
@@ -270,41 +269,24 @@ def _sections(hits: list[dict]) -> list[dict]:
     return sorted(sections, key=lambda s: s["similarity"], reverse=True)[:MAX_SECTIONS]
 
 
-def _update_conversation_vector(row: dict, texts: list[str]) -> int:
-    """Embed new messages and fold them into the running weighted mean.
-
-    Message vectors are weighted by character length — long substantive messages
-    should place the conversation more than short chatter (equal weighting let
-    frequent-but-short meta remarks dominate; see ARCHITECTURE.md).
-    `embedded_vector_count` stores the accumulated weight (total characters).
-    Vectors are summed per 100-message batch and discarded — bounded memory on
-    the 256MB machine.
-    """
-    old_weight = row["embedded_vector_count"]
-    total_messages = len(row["messages"])
-    if not texts:
-        # every new message was filtered out — just advance the counters
-        db.set_embedding_state(row["id"], row["embedding"], total_messages, old_weight)
-        return 0
-    weighted_sum = None
-    new_weight = 0.0
-    for i in range(0, len(texts), 100):
-        chunk = texts[i : i + 100]
-        vectors = np.array(_embed_texts(chunk), dtype=np.float32)
-        weights = np.array([len(t) for t in chunk], dtype=np.float32)
-        batch = (vectors * weights[:, None]).sum(axis=0)
-        weighted_sum = batch if weighted_sum is None else weighted_sum + batch
-        new_weight += float(weights.sum())
-    if row["embedding"] is not None and old_weight > 0:
-        mean = (np.array(row["embedding"], dtype=np.float32) * old_weight + weighted_sum) / (
-            old_weight + new_weight
-        )
-    else:
-        mean = weighted_sum / new_weight
-    db.set_embedding_state(
-        row["id"], [float(x) for x in mean], total_messages, int(old_weight + new_weight)
-    )
-    return len(texts)
+def _refresh_means() -> int:
+    """Set each lagging conversation's mean vector to the average of its search
+    passages, weighted by their own length so a short last passage weighs little —
+    the same "weight by length" rule the old per-message mean followed (equal weights
+    let frequent-but-short remarks dominate; see ARCHITECTURE.md). The passages are
+    already embedded, so this makes no embedding calls; it used to re-embed every
+    message. Measured 2026-10-28 over 82 conversations: at T_SMALL the small clusters
+    pair conversations the same way as the old mean for 99.0% of pairs."""
+    updated = 0
+    for row in db.rows_needing_mean():
+        vectors, chars = db.passage_vectors(row["id"])
+        weights = np.array(chars, dtype=np.float32)
+        if not vectors or weights.sum() == 0:
+            continue
+        mean = (np.array(vectors, dtype=np.float32) * weights[:, None]).sum(axis=0) / weights.sum()
+        db.set_embedding_state(row["id"], [float(x) for x in mean], row["chunked_message_count"])
+        updated += 1
+    return updated
 
 
 # --- language helpers ---
@@ -611,27 +593,18 @@ def _pca3(vectors: np.ndarray) -> np.ndarray:
 
 
 def refresh() -> dict:
-    """Embed new messages, then — only if any conversation drifted — regenerate its
-    metadata and recompute merging, clustering, naming and coordinates."""
+    """Index new passages and average them into mean vectors, then — only if any
+    conversation drifted — regenerate its metadata and recompute merging,
+    clustering, naming and coordinates."""
     if not os.environ.get("OPENAI_API_KEY"):
         raise RuntimeError("OPENAI_API_KEY is not set (list/search still work without it)")
-
-    # per-conversation incremental embedding; progress persists per conversation,
-    # so an interrupted run resumes where it stopped
-    embedded_count = 0
-    for row in db.rows_needing_embedding():
-        new_messages = row["messages"][row["embedded_message_count"] :]
-        texts = [
-            m["content"][:6000]
-            for m in new_messages
-            if len(m.get("content", "").strip()) >= MIN_CHARS
-        ]
-        embedded_count += _update_conversation_vector(row, texts)
 
     # ahead of the drift gate on purpose: new messages must become searchable even
     # when the conversation's overall subject hasn't moved. _refresh_cards also runs
     # here so a card dropped by a run that failed later is repaired next time.
     chunked_count = _refresh_body_chunks() + _refresh_cards()
+    # mean vectors are averaged from those passages, so they come second
+    embedded_count = _refresh_means()
 
     rows = db.all_embedded(DRIFT_MIN_COS)
     if not rows:

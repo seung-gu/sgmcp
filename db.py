@@ -1,5 +1,6 @@
 # Conversation storage and derived-data queries — Postgres (requires DATABASE_URL)
 
+import json
 import os
 from datetime import datetime, timezone
 
@@ -69,6 +70,9 @@ _SCHEMA = [
     # until their conversation is indexed again.
     "ALTER TABLE conversation_chunks ADD COLUMN IF NOT EXISTS first_message INT",
     "ALTER TABLE conversation_chunks ADD COLUMN IF NOT EXISTS last_message INT",
+    # Length of the passage's own text (overlap excluded): the weight it carries in the
+    # conversation's mean vector, so a short last passage can't pull the mean around.
+    "ALTER TABLE conversation_chunks ADD COLUMN IF NOT EXISTS chars INT",
     # Trigram indexes let keyword search's ILIKE '%…%' on title and summary skip a full
     # scan. They existed only in the database (from the trigram experiments); declaring
     # them here keeps a fresh database the same.
@@ -176,7 +180,7 @@ def _sync_messages(conn, conversation_id: int, messages: list[dict], replace: bo
             """
             UPDATE conversations
             SET chunk_version = 0, embedding = NULL, embedding_vec = NULL,
-                embedded_message_count = 0, embedded_vector_count = 0
+                embedded_message_count = 0
             WHERE id = %s
             """,
             (conversation_id,),
@@ -241,8 +245,6 @@ def save_conversation(
                                          THEN NULL ELSE conversations.embedding_vec END,
                     embedded_message_count = CASE WHEN %(count)s < conversations.embedded_message_count
                                                   THEN 0 ELSE conversations.embedded_message_count END,
-                    embedded_vector_count = CASE WHEN %(count)s < conversations.embedded_message_count
-                                                 THEN 0 ELSE conversations.embedded_vector_count END,
                     tagged_embedding = CASE WHEN %(count)s < conversations.embedded_message_count
                                             THEN NULL ELSE conversations.tagged_embedding END,
                     updated_at = now()
@@ -563,23 +565,35 @@ def semantic_search(vector: list[float], limit: int, min_similarity: float) -> l
 # --- derivation pipeline queries (used by grouping.refresh) ---
 
 
-def rows_needing_embedding() -> list[dict]:
-    """Conversations with messages not yet folded into their embedding."""
+def rows_needing_mean() -> list[dict]:
+    """Conversations whose mean vector lags their search passages: no mean yet, or
+    the passages have since covered more messages. Only conversations whose passages
+    are complete count, since the mean is taken from them."""
     with _connect() as conn:
         return conn.execute(
-            f"""
-            SELECT id, {_MESSAGES_OF} AS messages, embedding, embedded_message_count,
-                   embedded_vector_count
+            """
+            SELECT id, chunked_message_count
             FROM conversations
-            WHERE embedded_message_count < coalesce(message_count, 0)
+            WHERE chunked_message_count > 0
+              AND chunked_message_count = coalesce(message_count, 0)
+              AND (embedding IS NULL OR embedded_message_count <> chunked_message_count)
             ORDER BY id
             """
         ).fetchall()
 
 
-def set_embedding_state(
-    row_id: int, mean: list[float] | None, message_count: int, vector_count: int
-) -> None:
+def passage_vectors(row_id: int) -> tuple[list[list[float]], list[int]]:
+    """One conversation's body passage vectors and their own lengths, in order."""
+    with _connect() as conn:
+        rows = conn.execute(
+            "SELECT vec::text AS vec, chars FROM conversation_chunks"
+            " WHERE conversation_id = %s AND kind = 'body' ORDER BY chunk_index",
+            (row_id,),
+        ).fetchall()
+    return [json.loads(r["vec"]) for r in rows], [r["chars"] or 0 for r in rows]
+
+
+def set_embedding_state(row_id: int, mean: list[float], message_count: int) -> None:
     with _connect() as conn:
         conn.execute(
             """
@@ -587,11 +601,10 @@ def set_embedding_state(
             SET embedding = %s::real[],
                 embedding_vec = %s::real[]::vector,
                 embedded_message_count = %s,
-                embedded_vector_count = %s,
                 embedded_at = now()
             WHERE id = %s
             """,
-            (mean, mean, message_count, vector_count, row_id),
+            (mean, mean, message_count, row_id),
         )
 
 
@@ -646,7 +659,7 @@ def rows_needing_chunks(version: int, key: str | None = None) -> list[dict]:
                    OR chunk_version <> %(version)s
                    OR EXISTS (SELECT 1 FROM conversation_chunks
                               WHERE conversation_id = conversations.id AND kind = 'body'
-                                AND first_message IS NULL))
+                                AND (first_message IS NULL OR chars IS NULL)))
               AND (%(key)s::text IS NULL OR conversation_key = %(key)s)
             ORDER BY id
             """,
@@ -676,14 +689,14 @@ def replace_body_chunks(
     row_id: int,
     start: int,
     vectors: list[list[float]],
-    positions: list[tuple[int, int]],
+    positions: list[tuple[int, int, int]],
     message_count: int,
     indexed_count: int,
     version: int,
 ) -> bool:
     """Swap in body passages from chunk `start` on, keeping the ones before it.
-    `positions` holds every passage's (first, last) message, so kept passages that
-    predate the position columns get theirs too.
+    `positions` holds every passage's (first message, last message, own chars), so
+    kept passages that predate those columns get them too.
 
     The vectors were embedded outside any lock, from the state where `indexed_count`
     messages were indexed. If another run (a refresh, or the indexing after a save)
@@ -704,8 +717,8 @@ def replace_body_chunks(
         with conn.cursor() as cur:
             cur.executemany(
                 "INSERT INTO conversation_chunks"
-                " (conversation_id, kind, chunk_index, vec, first_message, last_message)"
-                " VALUES (%s, 'body', %s, %s::vector, %s, %s)",
+                " (conversation_id, kind, chunk_index, vec, first_message, last_message, chars)"
+                " VALUES (%s, 'body', %s, %s::vector, %s, %s, %s)",
                 [
                     (row_id, start + i, _vector_literal(v), *positions[start + i])
                     for i, v in enumerate(vectors)
@@ -714,12 +727,19 @@ def replace_body_chunks(
         kept = positions[:start]
         conn.execute(
             """
-            UPDATE conversation_chunks AS k SET first_message = p.first, last_message = p.last
-            FROM unnest(%s::int[], %s::int[], %s::int[]) AS p(chunk_index, first, last)
-            WHERE k.conversation_id = %s AND k.kind = 'body'
-              AND k.chunk_index = p.chunk_index AND k.first_message IS NULL
+            UPDATE conversation_chunks AS k
+            SET first_message = p.first, last_message = p.last, chars = p.chars
+            FROM unnest(%s::int[], %s::int[], %s::int[], %s::int[]) AS p(chunk_index, first, last, chars)
+            WHERE k.conversation_id = %s AND k.kind = 'body' AND k.chunk_index = p.chunk_index
+              AND (k.first_message IS NULL OR k.chars IS NULL)
             """,
-            (list(range(len(kept))), [f for f, _ in kept], [l for _, l in kept], row_id),
+            (
+                list(range(len(kept))),
+                [f for f, _, _ in kept],
+                [l for _, l, _ in kept],
+                [c for _, _, c in kept],
+                row_id,
+            ),
         )
         conn.execute(
             "UPDATE conversations SET chunked_message_count = %s, chunk_version = %s"
