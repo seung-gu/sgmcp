@@ -69,6 +69,20 @@ _SCHEMA = [
     "ALTER TABLE conversation_chunks ADD COLUMN IF NOT EXISTS last_message INT",
     # Which passage rule (grouping.CHUNK_VERSION) a conversation's passages were cut by.
     "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS chunk_version INT NOT NULL DEFAULT 1",
+    # One row per message, replacing the `messages` array: appending a turn then writes
+    # a few rows instead of rewriting the whole array (2.7 MB, ~2 s for the largest
+    # conversation). Filled alongside the array until reads switch over.
+    """
+    CREATE TABLE IF NOT EXISTS messages (
+        conversation_id BIGINT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+        idx INT NOT NULL,
+        role TEXT NOT NULL,
+        content TEXT NOT NULL,
+        at TIMESTAMPTZ,
+        PRIMARY KEY (conversation_id, idx)
+    )
+    """,
+    "ALTER TABLE conversations ADD COLUMN IF NOT EXISTS message_count INT",
     # What assistants searched for and which messages they then read — the only way
     # to see whether they follow a search hit through or stop at the first window.
     """
@@ -107,12 +121,56 @@ def _isoformat(row: dict) -> dict:
     return row
 
 
+# How many of the last stored messages must match the incoming list, position by
+# position, before only the new tail is written. A message removed or inserted
+# earlier shifts these positions too, so a match means nothing before them changed.
+# Reading them costs 10–70 KB, against rewriting up to 2.7 MB.
+TAIL_CHECK = 20
+
+
+def _sync_messages(conn, conversation_id: int, messages: list[dict], replace: bool) -> None:
+    """Make the messages table hold exactly `messages` for one conversation.
+
+    Normally the stored rows are a prefix of `messages` and only the tail is inserted.
+    When the last TAIL_CHECK stored rows differ from the same positions (the
+    conversation was rewritten), or `replace` is set, every row is rewritten. A content
+    change further back that keeps the count goes unnoticed — which is why an explicit
+    repair passes `replace`."""
+    stored = conn.execute(
+        "SELECT idx, role, content FROM messages WHERE conversation_id = %s"
+        " ORDER BY idx DESC LIMIT %s",
+        (conversation_id, TAIL_CHECK),
+    ).fetchall()
+    kept = stored[0]["idx"] + 1 if stored else 0
+    unchanged = kept <= len(messages) and all(
+        (messages[r["idx"]].get("role"), messages[r["idx"]].get("content"))
+        == (r["role"], r["content"])
+        for r in stored
+    )
+    if replace or not unchanged:
+        conn.execute("DELETE FROM messages WHERE conversation_id = %s", (conversation_id,))
+        kept = 0
+    with conn.cursor() as cur:
+        cur.executemany(
+            "INSERT INTO messages (conversation_id, idx, role, content) VALUES (%s, %s, %s, %s)",
+            [
+                (conversation_id, i, m.get("role", ""), m.get("content", ""))
+                for i, m in enumerate(messages[kept:], start=kept)
+            ],
+        )
+    conn.execute(
+        "UPDATE conversations SET message_count = %s WHERE id = %s",
+        (len(messages), conversation_id),
+    )
+
+
 def save_conversation(
     key: str,
     messages: list[dict],
     source: str,
     project: str = "",
     source_url: str = "",
+    replace: bool = False,
 ) -> dict:
     """Create a conversation, or overwrite it wholesale (repair). Title, tags and
     summary are filled in by server-side derivation.
@@ -120,7 +178,10 @@ def save_conversation(
     Derived artifacts (embedding, anchor) are reset only when the message count
     shrinks — i.e. the content was genuinely rewritten. A re-backfill or a normal
     growth keeps them, so incremental embedding picks up from where it left off
-    (an overwrite that keeps or grows the count doesn't waste a re-embed)."""
+    (an overwrite that keeps or grows the count doesn't waste a re-embed).
+
+    In the messages table, `replace` rewrites every row (an explicit repair);
+    otherwise only the new tail is written (see _sync_messages)."""
     with _connect() as conn:
         row = conn.execute(
             """
@@ -153,6 +214,7 @@ def save_conversation(
             """,
             (key, Jsonb(messages), source, project, source_url),
         ).fetchone()
+        _sync_messages(conn, row["id"], messages, replace)
     return {
         "conversation_key": key,
         "message_count": len(messages),
@@ -165,7 +227,7 @@ def append_messages(
 ) -> dict | None:
     with _connect() as conn:
         row = conn.execute(
-            "SELECT messages, source_url FROM conversations WHERE conversation_key = %s FOR UPDATE",
+            "SELECT id, messages, source_url FROM conversations WHERE conversation_key = %s FOR UPDATE",
             (key,),
         ).fetchone()
         if row is None:
@@ -192,6 +254,7 @@ def append_messages(
             """,
             (Jsonb(new_messages), project, project, source_url, source_url, key),
         ).fetchone()
+        _sync_messages(conn, row["id"], current + new_messages, replace=False)
     total = updated["total"]
     has_url = bool(row["source_url"] or source_url)
     result = {"conversation_key": key, "appended": n, "total_messages": total}

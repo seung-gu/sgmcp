@@ -55,7 +55,10 @@ def save_conversation(
     response for all later append_messages calls. Title, tags and summary are
     generated server-side — do not send them."""
     key = conversation_key or f"cw-{uuid.uuid4()}"
-    result = db.save_conversation(key, [m.model_dump() for m in messages], source, project)
+    # a key means an explicit repair, which may change any message: rewrite them all
+    result = db.save_conversation(
+        key, [m.model_dump() for m in messages], source, project, replace=bool(conversation_key)
+    )
     grouping.index_soon(key)
     return result
 
