@@ -81,7 +81,7 @@ sequenceDiagram
     participant DB as Neon
 
     CC->>H: turn ends (transcript path on stdin)
-    H->>H: extract conversation text from JSONL<br/>(tool output, internal logs and API error notices dropped)
+    H->>H: extract conversation text from JSONL<br/>(tool output, internal logs, API error notices<br/>and compaction summaries dropped)
     H->>S: last 20 messages + their position (cc-sessionUUID, token header)
     S->>DB: insert the ones not stored yet
     S-->>H: 409 when the stored messages stop short of them or differ

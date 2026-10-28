@@ -57,8 +57,15 @@ def _extract(transcript_path: Path) -> tuple[list[dict], str]:
         if entry.get("type") not in ("user", "assistant"):
             continue
         # API error notices (overload, outage, flagged turns) are written by the client,
-        # not the model — storing them would only replay them into later conversations
-        if entry.get("isSidechain") or entry.get("isMeta") or entry.get("isApiErrorMessage"):
+        # not the model — storing them would only replay them into later conversations.
+        # A compaction summary is the client's recap of earlier messages, which are
+        # stored already, written in as if the user had sent it.
+        if (
+            entry.get("isSidechain")
+            or entry.get("isMeta")
+            or entry.get("isApiErrorMessage")
+            or entry.get("isCompactSummary")
+        ):
             continue
         text = _text_of(entry.get("message", {}).get("content"))
         if not text or text.startswith("Caveat:") or any(m in text for m in NOISE_MARKERS):
