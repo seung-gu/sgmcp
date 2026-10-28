@@ -54,7 +54,7 @@ measurements behind each tuned value.
 |---|---|
 | `save_conversation(messages, source?, project?, key?)` | Create a conversation (the server issues a `cw-`+UUID key when none is given), or overwrite one to repair it |
 | `append_messages(key, new_messages, project?, source_url?)` | Append the latest turn; an identical resend is ignored. `source_url` stores the chat's address for reopening |
-| `get_conversation(key, full=False)` | Load one conversation, summary first; `full=true` adds the verbatim messages |
+| `get_conversation(key, full=False, last=20)` | Load one conversation, summary first; `full=true` adds the verbatim messages, the most recent 20 unless `last` says otherwise (`last=0` for all) |
 | `list_conversations(limit)` | Recent conversations, without message bodies |
 | `search_conversations(query, limit)` | Keyword search over title, summary and content |
 | `search_conversations_by_meaning(query, limit)` | Meaning search for a topic whose exact words are unknown; new messages become searchable seconds after they are saved |

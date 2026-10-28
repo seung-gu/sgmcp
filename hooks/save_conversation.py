@@ -50,7 +50,9 @@ def _extract(transcript_path: Path) -> tuple[list[dict], str]:
         cwd = entry.get("cwd") or cwd
         if entry.get("type") not in ("user", "assistant"):
             continue
-        if entry.get("isSidechain") or entry.get("isMeta"):
+        # API error notices (overload, outage, flagged turns) are written by the client,
+        # not the model — storing them would only replay them into later conversations
+        if entry.get("isSidechain") or entry.get("isMeta") or entry.get("isApiErrorMessage"):
             continue
         text = _text_of(entry.get("message", {}).get("content"))
         if not text or text.startswith("Caveat:") or any(m in text for m in NOISE_MARKERS):

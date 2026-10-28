@@ -81,7 +81,7 @@ sequenceDiagram
     participant DB as Neon
 
     CC->>H: turn ends (transcript path on stdin)
-    H->>H: extract conversation text from JSONL<br/>(tool output and internal logs dropped)
+    H->>H: extract conversation text from JSONL<br/>(tool output, internal logs and API error notices dropped)
     H->>S: full upsert (cc-sessionUUID, token header)
     S->>DB: replace wholesale
     S-)S: index new search passages (background)

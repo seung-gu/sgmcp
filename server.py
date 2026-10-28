@@ -102,19 +102,33 @@ def get_conversation(
     full: Annotated[
         bool,
         Field(
-            description="false: summary-centric, lightweight. true: include the full verbatim "
+            description="false: summary-centric, lightweight. true: include the verbatim "
             "messages — only when continuing the conversation or quoting exactly"
         ),
     ] = False,
+    last: Annotated[
+        int,
+        Field(
+            description="how many of the most recent messages to return with them; 0 returns "
+            "every message — use it only when the earlier part is really needed",
+            ge=0,
+        ),
+    ] = 20,
 ) -> dict:
-    """Loads one stored conversation."""
+    """Loads one stored conversation. Messages come back trimmed to the most recent
+    ones; message_count and messages_omitted say how much was left out."""
     conversation = db.get_conversation(conversation_key)
     if conversation is None:
         raise ValueError(
             f"'{conversation_key}' not found. Check the key with list_conversations."
         )
+    messages = conversation["messages"]
+    conversation["message_count"] = len(messages)
     if not full and conversation.get("summary"):
         conversation.pop("messages")
+    elif last and len(messages) > last:
+        conversation["messages"] = messages[-last:]
+        conversation["messages_omitted"] = len(messages) - last
     return conversation
 
 
