@@ -149,35 +149,47 @@ def _sync_messages(conn, conversation_id: int, messages: list[dict], replace: bo
         == (r["role"], r["content"])
         for r in stored
     )
-    previous: dict[int, dict] = {}
+    # times of the rows being replaced, by content: a message that survives the rewrite
+    # keeps its time even when removals earlier in the list shifted its position
+    previous: dict[tuple[str, str], list] = {}
     if replace or not unchanged:
-        previous = {
-            r["idx"]: r
-            for r in conn.execute(
-                "SELECT idx, role, content, at FROM messages WHERE conversation_id = %s",
-                (conversation_id,),
-            )
-        }
+        for r in conn.execute(
+            "SELECT role, content, at FROM messages WHERE conversation_id = %s ORDER BY idx",
+            (conversation_id,),
+        ):
+            previous.setdefault((r["role"], r["content"]), []).append(r["at"])
         conn.execute("DELETE FROM messages WHERE conversation_id = %s", (conversation_id,))
         kept = 0
+        # Indexes derived from the old rows no longer line up: search passages and the
+        # mean vector only ever extend from where they stopped, which is wrong once an
+        # earlier message changed. chunk_version 0 makes the next indexing re-cut from
+        # scratch; the mean is rebuilt on the next refresh. The metadata anchor stays,
+        # so titles regenerate only if the subject actually drifted.
+        conn.execute(
+            """
+            UPDATE conversations
+            SET chunk_version = 0, embedding = NULL, embedding_vec = NULL,
+                embedded_message_count = 0, embedded_vector_count = 0
+            WHERE id = %s
+            """,
+            (conversation_id,),
+        )
     now = datetime.now(timezone.utc)
 
-    def at_of(i: int, message: dict):
-        """The time the client sent; else, for a message that survives a rewrite in
-        place, the time it already had (even if unknown); else now, as it just arrived."""
+    def at_of(message: dict):
+        """The time the client sent; else, for a message that survives a rewrite, the
+        time it already had (even if unknown); else now, as it just arrived."""
         if message.get("at"):
             return message["at"]
-        old = previous.get(i)
-        if old and (old["role"], old["content"]) == (message.get("role"), message.get("content")):
-            return old["at"]
-        return now
+        olds = previous.get((message.get("role"), message.get("content")))
+        return olds.pop(0) if olds else now
 
     with conn.cursor() as cur:
         cur.executemany(
             "INSERT INTO messages (conversation_id, idx, role, content, at)"
             " VALUES (%s, %s, %s, %s, %s::timestamptz)",
             [
-                (conversation_id, i, m.get("role", ""), m.get("content", ""), at_of(i, m))
+                (conversation_id, i, m.get("role", ""), m.get("content", ""), at_of(m))
                 for i, m in enumerate(messages[kept:], start=kept)
             ],
         )
