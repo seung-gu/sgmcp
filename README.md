@@ -106,6 +106,7 @@ curl -X POST http://localhost:8000/mcp \
 | `INGEST_TOKEN` | Auth token for `POST /api/ingest`, used by the Claude Code hook |
 | `OPENAI_API_KEY` | Embeddings, meaning search and metadata generation. List and keyword search work without it |
 | `ARCHIVE_LANGUAGE` | Language of all derived text: titles, tags, summaries, group names (default: Korean) |
+| `EVAL_DATABASE_URL` | Connection string of the eval branch (see Evaluating search). Only the eval and its pre-push hook use it |
 
 ### Connecting a client
 
@@ -118,6 +119,21 @@ and the connection fails.
   hook and put `INGEST_TOKEN` in the local `.env`. After every turn it sends the
   session's last 20 messages to `/api/ingest`, and the whole session only when the
   server is further behind; run it with `--backfill` to push past sessions.
+
+### Evaluating search
+
+`eval/run.py` scores meaning search on 62 reviewed questions with known answers:
+paraphrased, pinpoint, whole-conversation and absent-topic questions. The questions and
+the archive they were written against live on a Neon branch of their own
+(`EVAL_DATABASE_URL`), so scores don't move as conversations arrive, and the questions
+stay out of this public repository. Each run is stored there; a run accepted as the
+baseline is what later runs are compared with, question by question.
+
+```bash
+uv run --group eval --env-file .env python eval/run.py            # score, compare with the baseline
+uv run --group eval --env-file .env python eval/run.py --accept   # make this run the baseline
+git config core.hooksPath .githooks   # score before any push that changes search code
+```
 
 ### Deploying
 

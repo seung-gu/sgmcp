@@ -1,0 +1,36 @@
+#!/bin/sh
+# Before a push that changes search code, score meaning search on the eval branch
+# (eval/run.py) and stop the push when a question that passed in the baseline fails
+# now, or when the eval itself crashes. Enable once per clone:
+#   git config core.hooksPath .githooks
+# Push past it once with: git push --no-verify
+
+cd "$(git rev-parse --show-toplevel)" || exit 1
+zero=0000000000000000000000000000000000000000
+watched="db.py grouping.py eval/"
+
+changed=""
+while read -r local_ref local_sha remote_ref remote_sha; do
+    [ "$local_sha" = "$zero" ] && continue  # deleting a remote branch
+    if [ "$remote_sha" = "$zero" ] || ! git cat-file -e "$remote_sha" 2>/dev/null; then
+        changed="new branch"  # nothing local to diff against: score it
+    else
+        # shellcheck disable=SC2086
+        changed="$changed$(git diff --name-only "$remote_sha" "$local_sha" -- $watched)"
+    fi
+done
+[ -z "$changed" ] && exit 0
+
+if ! grep -q '^EVAL_DATABASE_URL=' .env 2>/dev/null; then
+    echo "pre-push: no EVAL_DATABASE_URL in .env, so the search eval is skipped" >&2
+    exit 0
+fi
+# shellcheck disable=SC2086
+if ! git diff --quiet HEAD -- $watched; then
+    echo "pre-push: uncommitted changes in search code are scored too" >&2
+fi
+echo "pre-push: search code changed; scoring it on the eval branch" >&2
+uv run --group eval --env-file .env python eval/run.py >&2 || {
+    echo "pre-push: the search eval found regressions or failed (above); push anyway with git push --no-verify" >&2
+    exit 1
+}

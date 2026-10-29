@@ -10,3 +10,8 @@ dependencies = [
     "pydantic-ai-slim[openai]>=2.9.1",
     "scipy>=1.18.1",
 ]
+
+[dependency-groups]
+eval = [
+    "pydantic-ai-slim[evals]>=2.9.1",
+]
