@@ -6,8 +6,11 @@ WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --locked --no-cache
 
-COPY server.py db.py grouping.py dashboard.py ingest.py ./
+COPY server.py db.py grouping.py dashboard.py ingest.py auth.py ./
 COPY static ./static
+
+RUN useradd --create-home app   # unprivileged user to run the server
+USER app
 
 EXPOSE 8000
 
