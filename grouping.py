@@ -13,7 +13,8 @@ from typing import Literal
 import httpx
 import numpy as np
 from pydantic import BaseModel, Field, create_model
-from pydantic_ai import Agent, ModelRetry
+from pydantic_ai import Agent, ModelRetry, UnexpectedModelBehavior, capture_run_messages
+from pydantic_ai.messages import RetryPromptPart
 from scipy.cluster.hierarchy import fcluster, linkage
 
 import db
@@ -24,7 +25,13 @@ GEN_MODEL = "openai:gpt-4.1-mini"  # metadata generation, tag merging
 # the same two-step prompt: misfiled groups gpt-4.1-mini ~6, gpt-5.4-mini ~5, gpt-5.5
 # ~3, at about $0.01 / $0.02 / $0.18 a regroup — the 5.4 mini is the balance.
 TREE_MODEL = "openai:gpt-5.4-mini"
-MIN_BIG, MAX_BIG = 5, 10  # big categories in the tree
+# Big categories the tree aims for, given to the model as a target only. A hard
+# bound sent it back whenever it drew one more: on 2026-10-29 every tree for the ~35
+# groups sat on the ceiling (10, and 12 when raised), and one in three failed the
+# refresh. Each naming call may still be sent back 4 times, for language or a group
+# left out.
+MIN_BIG, MAX_BIG = 5, 15
+TREE_RETRIES = 4
 
 # All derived text (titles, tags, summaries, group names) is written in this
 # language regardless of the conversation's language — the archive reads as one.
@@ -402,7 +409,7 @@ def _merge_suggestions(vocabulary: list[str]) -> dict[str, str]:
 
 def _name_tree(rows: list[dict], small_clusters: list[list[int]]) -> list[tuple[str, str]]:
     """Name every small cluster and shelve it under a big category, in two calls:
-    first invent MIN_BIG–MAX_BIG categories, each with a line on what it holds, then
+    first invent about MIN_BIG–MAX_BIG categories, each with a line on what it holds, then
     place every cluster into exactly one of them. One call doing both filed software
     projects under job hunting; as a closed choice against stated scopes the placement
     holds. Members are shown by title and summary — tags alone named an admin group
@@ -413,26 +420,28 @@ def _name_tree(rows: list[dict], small_clusters: list[list[int]]) -> list[tuple[
         + "\n".join(f"  - {rows[m]['title']} — {rows[m]['summary'][:200]}" for m in members)
         for ci, members in enumerate(small_clusters)
     )
-    propose = Agent(TREE_MODEL, output_type=BigCategories, retries=2)
+    propose = Agent(TREE_MODEL, output_type=BigCategories, retries=TREE_RETRIES)
 
     @propose.output_validator
     def check_categories(ctx, output: BigCategories) -> BigCategories:
-        if not MIN_BIG <= len(output.categories) <= MAX_BIG:
-            raise ModelRetry(f"Give {MIN_BIG}-{MAX_BIG} categories, not {len(output.categories)}.")
+        if not output.categories:  # the placement step needs at least one to choose from
+            raise ModelRetry("Propose at least one category.")
         if not _output_language_ok(" ".join(c.name + " " + c.holds for c in output.categories)):
             raise ModelRetry(f"Write the categories in {ARCHIVE_LANGUAGE}.")
         return output
 
-    proposed = propose.run_sync(
+    proposed = _run_checked(
+        propose,
         "Below are the topic groups of one person's archive of AI conversations (title — "
-        f"summary of each member). Propose {MIN_BIG}-{MAX_BIG} big categories, in "
+        f"summary of each member). Propose about {MIN_BIG}-{MAX_BIG} big categories, in "
         f"{ARCHIVE_LANGUAGE}, that together cover every group, the way this person would "
         "shelve them. Categorize by what the person was doing in the conversation (e.g. "
         "building a piece of software, applying for jobs, dealing with an authority), not "
         "by words that merely appear in it. Do not merge unrelated topics just to make a "
         "category bigger: a category may hold a single group when its topic is unlike the "
-        "others.\n\n" + listing
-    ).output.categories
+        "others.\n\n" + listing,
+        "naming the big categories",
+    ).categories
     scopes = {}
     for c in proposed:
         scopes.setdefault(_bare(c.name), c.holds)
@@ -446,7 +455,7 @@ def _name_tree(rows: list[dict], small_clusters: list[list[int]]) -> list[tuple[
     place = Agent(
         TREE_MODEL,
         output_type=create_model("Placements", placements=(list[Placement], ...)),
-        retries=2,
+        retries=TREE_RETRIES,
     )
 
     @place.output_validator
@@ -458,15 +467,34 @@ def _name_tree(rows: list[dict], small_clusters: list[list[int]]) -> list[tuple[
             raise ModelRetry(f"Write the group names in {ARCHIVE_LANGUAGE}.")
         return output
 
-    placements = place.run_sync(
+    placements = _run_checked(
+        place,
         "Place every group below into exactly one of these categories, and name each "
         f"group, in {ARCHIVE_LANGUAGE}, after what its conversations share.\n\n"
         "Categories:\n"
         + "\n".join(f"- {name}: {holds}" for name, holds in scopes.items())
-        + "\n\nGroups:\n" + listing
-    ).output.placements
+        + "\n\nGroups:\n" + listing,
+        "placing the groups",
+    ).placements
     tree = {p.group_id: (_bare(p.name), p.category) for p in placements}
     return [tree[ci] for ci in range(len(small_clusters))]
+
+
+def _run_checked(agent: Agent, prompt: str, step: str):
+    """Run an agent whose output validator may send it back. When it runs out of
+    retries, name the checks it kept failing: a bare "Exceeded maximum output
+    retries" on the dashboard says nothing about what to fix."""
+    with capture_run_messages() as messages:
+        try:
+            return agent.run_sync(prompt).output
+        except UnexpectedModelBehavior as e:
+            reasons = [
+                str(part.content)[:200]
+                for message in messages
+                for part in getattr(message, "parts", [])
+                if isinstance(part, RetryPromptPart)
+            ]
+            raise RuntimeError(f"{step}: {e}; sent back with: {' | '.join(reasons)}") from e
 
 
 def _consolidate_tags() -> dict[str, str]:

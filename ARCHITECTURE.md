@@ -111,7 +111,7 @@ flowchart TD
     G -- "none" --> K["small clusters (geometry, every refresh)<br/>passage mean + card · per-language centering<br/>average linkage · cosine 0.28"]
     K --> CH{"anything drifted, or clusters<br/>differ from the stored ones?"}
     CH -- "no" --> X(["done — groups, names, coordinates all kept<br/>zero LLM calls"])
-    CH -- "yes" --> N["🤖 name the whole tree — gpt-5.4-mini, two calls<br/>① invent 5–10 big categories, each with what it holds<br/>② place every group into one (closed choice) and name it<br/>failure stores nothing, so the next refresh retries"]
+    CH -- "yes" --> N["🤖 name the whole tree — gpt-5.4-mini, two calls<br/>① invent about 5–15 big categories (a target, not checked), each with what it holds<br/>② place every group into one (closed choice) and name it<br/>failure stores nothing, so the next refresh retries"]
     N --> P["3D coordinates (PCA) → store everything"]
 ```
 

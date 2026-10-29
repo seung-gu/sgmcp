@@ -75,7 +75,8 @@ def register(mcp) -> None:
             return _unauthorized()
         try:
             stats = await run_in_threadpool(grouping.refresh)
-        except RuntimeError as e:
+        except RuntimeError as e:  # no API key, or a model that kept failing its checks
+            logging.getLogger(__name__).warning("refresh failed: %s", e)
             return JSONResponse({"error": str(e)}, status_code=400)
         except Exception as e:  # a deadlock, a failed model call: name it on the dashboard
             logging.getLogger(__name__).exception("refresh failed")
