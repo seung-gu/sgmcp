@@ -122,22 +122,20 @@ and the connection fails.
 
 ### Evaluating search
 
-`eval/run.py` runs three evals against answers that live, with the archive they were
+`eval/run.py` runs two evals against answers that live, with the archive they were
 written against, on a Neon branch of their own (`EVAL_DATABASE_URL`), so scores don't
 move as conversations arrive and the answers stay out of this public repository:
 
 - **meaning**: meaning search on 62 reviewed questions (paraphrased, pinpoint,
   whole-conversation, absent-topic)
 - **groups**: the small topic groups, on the conversation pairs two LLM filings agreed on
-- **naming** (`--naming`, calls the tree model): the group and category names, by rules,
-  placement against two big-category filings (`eval/build_categories.py`) and name fit
 
-Each run is stored on the branch; the run accepted as the baseline is what later runs
-are compared with, and a regression exits 1.
+Neither calls an LLM, so the same code always gets the same numbers. Each run is stored
+on the branch; the run accepted as the baseline is what later runs are compared with,
+and a regression exits 1.
 
 ```bash
 uv run --group eval --env-file .env python eval/run.py            # score, compare with the baselines
-uv run --group eval --env-file .env python eval/run.py --naming --repeat 3   # also the names
 uv run --group eval --env-file .env python eval/run.py --accept   # make this run the baseline
 git config core.hooksPath .githooks   # run them before any push that changes search or grouping code
 ```

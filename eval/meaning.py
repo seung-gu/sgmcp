@@ -19,7 +19,7 @@ RANKS = (1, 3, 5)  # an answer passes rankN when its conversation comes in the t
 # on v1, every real answer scored at least this, while the search floor
 # (MIN_SIMILARITY) sits lower
 ABSENT_BELOW = 0.35
-SCORE_TOLERANCE: dict[str, float] = {}  # assertions only; any flip counts
+GATED_SCORES: tuple[str, ...] = ()  # assertions only; any flip counts
 
 
 def dataset(version: str) -> Dataset:

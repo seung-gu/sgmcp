@@ -9,8 +9,9 @@ from pydantic_evals import Case, Dataset
 from pydantic_evals.evaluators import Evaluator, EvaluatorContext
 from pydantic_evals.reporting import EvaluationReport
 
-# the clustering is deterministic, so any drop in F1 is a real one
-SCORE_TOLERANCE = {"f1": 0.0}
+# the clustering is deterministic, so any drop in F1 is a real one; precision and
+# recall may trade against each other
+GATED_SCORES = ("f1",)
 _pairs: dict[str, set[tuple[str, str]]] = {}  # the version's agreed pairs, set by dataset()
 
 
@@ -26,13 +27,6 @@ def agreed(runs: list[list[list[str]]]) -> dict[str, set[tuple[str, str]]]:
     return {"together": set.intersection(*together), "apart": every - set.union(*together)}
 
 
-def clusters() -> tuple[list[dict], list[list[int]]]:
-    """The rows and small clusters exactly as grouping.refresh computes them."""
-    rows = db.all_embedded(grouping.DRIFT_MIN_COS)
-    matrix = grouping._center_by_language(grouping._load_matrix(rows), rows)
-    return rows, grouping._agglomerate(matrix, grouping.T_SMALL)
-
-
 def dataset(version: str) -> Dataset:
     with db._connect() as conn:
         body = conn.execute(
@@ -44,23 +38,23 @@ def dataset(version: str) -> Dataset:
 
 
 def task(_: str) -> list[list[str]]:
-    rows, small = clusters()
-    return [[rows[m]["conversation_key"] for m in members] for members in small]
-
-
-def pair_scores(got: set[tuple[str, str]], answer: dict[str, set[tuple[str, str]]]) -> dict[str, float]:
-    """Precision over the scored pairs a grouping puts together, recall over the pairs
-    that belong together, and their F1."""
-    hits = len(got & answer["together"])
-    precision = hits / max(hits + len(got & answer["apart"]), 1)
-    recall = hits / len(answer["together"])
-    return {"f1": 2 * precision * recall / max(precision + recall, 1e-9), "precision": precision, "recall": recall}
+    """The small clusters exactly as grouping.refresh computes them, by conversation key."""
+    rows = db.all_embedded(grouping.DRIFT_MIN_COS)
+    matrix = grouping._center_by_language(grouping._load_matrix(rows), rows)
+    return [[rows[m]["conversation_key"] for m in members] for members in grouping._agglomerate(matrix, grouping.T_SMALL)]
 
 
 @dataclass
 class PairF1(Evaluator):
+    """Precision over the scored pairs the groups put together, recall over the pairs
+    that belong together, and their F1."""
+
     def evaluate(self, ctx: EvaluatorContext) -> dict[str, float]:
-        return pair_scores(pairs(ctx.output), _pairs)
+        got = pairs(ctx.output)
+        hits = len(got & _pairs["together"])
+        precision = hits / max(hits + len(got & _pairs["apart"]), 1)
+        recall = hits / len(_pairs["together"])
+        return {"f1": 2 * precision * recall / max(precision + recall, 1e-9), "precision": precision, "recall": recall}
 
 
 def summary(report: EvaluationReport, baseline: EvaluationReport | None) -> None:

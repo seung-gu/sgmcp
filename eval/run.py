@@ -2,23 +2,20 @@
 
 Each version of the eval set has its own Neon branch: a copy of the archive taken when
 its answers were written, plus the eval_answers table holding them, which exists on
-that branch only. Every eval runs there (EVAL_DATABASE_URL), so new conversations never
-move a score and the questions stay out of this public repository. Every run is kept in
-eval_reports on the same branch; the last one accepted is the baseline later runs are
-compared with.
+that branch only. Both evals run there (EVAL_DATABASE_URL), so new conversations never
+move a score and the answers stay out of this public repository. Neither calls an LLM,
+and the same code always gets the same numbers. Every run is kept in eval_reports on
+the same branch; the last one accepted is the baseline later runs are compared with.
 
-    meaning  meaning search on reviewed questions (free)
-    groups   the small topic groups against two LLM filings (free)
-    naming   group and category names; calls TREE_MODEL once per repeat, so it runs
-             only with --naming
+    meaning  meaning search on reviewed questions
+    groups   the small topic groups against two LLM filings
 
     uv run --group eval --env-file .env python eval/run.py [--version v1]
-        [--naming [--repeat 3]] [--set MIN_SIMILARITY=0.35] [--accept]
+        [--set MIN_SIMILARITY=0.35] [--accept]
 
 --set overrides a grouping constant for this run, to try a value before changing it.
 --accept makes this run the baseline. The exit code is 1 when an eval got worse than
-its baseline: an assertion that held there fails now, or a score fell by more than the
-eval's tolerance.
+its baseline: an assertion that held there fails now, or a gated score fell.
 """
 import argparse
 import dataclasses
@@ -36,37 +33,29 @@ import db  # noqa: E402
 import grouping  # noqa: E402
 import groups  # noqa: E402
 import meaning  # noqa: E402
-import naming  # noqa: E402
 from pydantic import TypeAdapter  # noqa: E402
 from pydantic_evals.reporting import EvaluationReport  # noqa: E402
 
-EVALS = {"meaning": meaning, "groups": groups, "naming": naming}
-SETTINGS = ("MIN_SIMILARITY", "SECTION_MARGIN", "SECTION_GAP", "MAX_SECTIONS", "T_SMALL", "TREE_MODEL")
+EVALS = {"meaning": meaning, "groups": groups}
+SETTINGS = ("MIN_SIMILARITY", "SECTION_MARGIN", "SECTION_GAP", "MAX_SECTIONS", "T_SMALL")
 REPORT = TypeAdapter(EvaluationReport)
 
 
 def results(report: EvaluationReport) -> tuple[dict, dict]:
-    """Per case, repeats merged: whether each assertion held in every repeat, and each
-    score's mean. A case whose task failed has neither."""
-    held: dict[tuple[str, str], bool] = {}
-    scores: dict[tuple[str, str], list[float]] = {}
-    for case in report.cases:
-        name = case.source_case_name or case.name
-        for key, a in case.assertions.items():
-            held[(name, key)] = held.get((name, key), True) and bool(a.value)
-        for key, s in case.scores.items():
-            scores.setdefault((name, key), []).append(s.value)
-    return held, {k: sum(v) / len(v) for k, v in scores.items()}
+    """Per case, each assertion's outcome and each score. A case whose task failed has neither."""
+    held = {(c.name, k): bool(a.value) for c in report.cases for k, a in c.assertions.items()}
+    scores = {(c.name, k): s.value for c in report.cases for k, s in c.scores.items()}
+    return held, scores
 
 
-def regressions(tolerance: dict[str, float], report: EvaluationReport, baseline: EvaluationReport) -> list[str]:
+def regressions(gated: tuple[str, ...], report: EvaluationReport, baseline: EvaluationReport) -> list[str]:
     held, scores = results(report)
     held_before, scores_before = results(baseline)
     worse = [f"{name}: {key} held, now fails" for (name, key), ok in held_before.items()
              if ok and not held.get((name, key), False)]
     for (name, key), before in scores_before.items():
         now = scores.get((name, key))
-        if key in tolerance and (now is None or now < before - tolerance[key] - 1e-9):
+        if key in gated and (now is None or now < before - 1e-9):
             worse.append(f"{name}: {key} {before:.3f} -> {'failed' if now is None else f'{now:.3f}'}")
     return worse
 
@@ -92,8 +81,6 @@ def git_commit() -> str:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--version", default="v1")
-    parser.add_argument("--naming", action="store_true", help="also score names (calls TREE_MODEL)")
-    parser.add_argument("--repeat", type=int, default=1, help="trees to average in the naming eval")
     parser.add_argument("--set", action="append", default=[], metavar="NAME=VALUE")
     parser.add_argument("--accept", action="store_true", help="make this run the baseline")
     args = parser.parse_args()
@@ -111,20 +98,17 @@ def main() -> None:
             """CREATE TABLE IF NOT EXISTS eval_reports (
                    id         serial PRIMARY KEY,
                    version    text NOT NULL,
+                   kind       text NOT NULL,
                    made_at    timestamptz NOT NULL DEFAULT now(),
                    git_commit text NOT NULL,
                    settings   jsonb NOT NULL,
                    report     jsonb NOT NULL,
                    baseline   boolean NOT NULL DEFAULT false)"""
         )
-        conn.execute("ALTER TABLE eval_reports ADD COLUMN IF NOT EXISTS kind text NOT NULL DEFAULT 'meaning'")
 
     worse = []
-    for kind in ("meaning", "groups") + (("naming",) if args.naming else ()):
-        module = EVALS[kind]
-        report = module.dataset(args.version).evaluate_sync(
-            module.task, max_concurrency=8, progress=False, repeat=args.repeat if kind == "naming" else 1
-        )
+    for kind, module in EVALS.items():
+        report = module.dataset(args.version).evaluate_sync(module.task, max_concurrency=8, progress=False)
         with db._connect() as conn:
             row = conn.execute(
                 "SELECT id, git_commit, report FROM eval_reports"
@@ -134,8 +118,7 @@ def main() -> None:
             conn.execute(
                 "INSERT INTO eval_reports (version, kind, git_commit, settings, report, baseline)"
                 " VALUES (%s, %s, %s, %s, %s, %s)",
-                (args.version, kind, commit, json.dumps(settings),
-                 REPORT.dump_json(report).decode(), args.accept),
+                (args.version, kind, commit, json.dumps(settings), REPORT.dump_json(report).decode(), args.accept),
             )
         baseline = REPORT.validate_python(row["report"]) if row else None
 
@@ -146,7 +129,7 @@ def main() -> None:
         if baseline:
             if kind == "meaning":
                 changed_cases(report, baseline)
-            found = regressions(module.SCORE_TOLERANCE, report, baseline)
+            found = regressions(module.GATED_SCORES, report, baseline)
             worse += [f"{kind} {w}" for w in found]
             for w in found:
                 print(f"  WORSE {w}")
