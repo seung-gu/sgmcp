@@ -1,5 +1,6 @@
 # Dashboard web routes — served by the same process as MCP, kept in their own module
 
+import logging
 import os
 import secrets
 from pathlib import Path
@@ -76,4 +77,7 @@ def register(mcp) -> None:
             stats = await run_in_threadpool(grouping.refresh)
         except RuntimeError as e:
             return JSONResponse({"error": str(e)}, status_code=400)
+        except Exception as e:  # a deadlock, a failed model call: name it on the dashboard
+            logging.getLogger(__name__).exception("refresh failed")
+            return JSONResponse({"error": f"refresh failed: {type(e).__name__}: {e}"}, status_code=500)
         return JSONResponse(stats)

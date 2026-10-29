@@ -109,9 +109,12 @@ def _connect() -> psycopg.Connection:
     global _schema_ready
     conn = psycopg.connect(os.environ["DATABASE_URL"], row_factory=dict_row)
     if not _schema_ready:
+        # One transaction per statement: ALTER TABLE ... IF NOT EXISTS locks the whole
+        # table even when there is nothing to add, and holding that lock while waiting
+        # on the next table deadlocked a refresh that was writing chunks (2026-10-29).
         for statement in _SCHEMA:
             conn.execute(statement)
-        conn.commit()
+            conn.commit()
         _schema_ready = True
     return conn
 
