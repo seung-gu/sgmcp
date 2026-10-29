@@ -118,7 +118,10 @@ and the connection fails.
 - **Claude Code auto-save**: register `hooks/save_conversation.py` as a global Stop
   hook and put `INGEST_TOKEN` in the local `.env`. After every turn it sends the
   session's last 20 messages to `/api/ingest`, and the whole session only when the
-  server is further behind; run it with `--backfill` to push past sessions.
+  server is further behind; run it with `--backfill` to push past sessions. A session
+  continued as a background job starts as a copy under a new ID, so the same messages
+  get saved twice; `scripts/merge_duplicates.py` finds such copies and, with `--apply`,
+  merges them.
 
 ### Evaluating search
 
