@@ -15,9 +15,9 @@ graph LR
     end
 
     subgraph sgmcp["sgmcp — Fly.io Frankfurt, suspends when idle"]
-        M["/mcp<br/>MCP endpoint"]
+        M["/mcp<br/>MCP endpoint, WorkOS OAuth"]
         I["/api/ingest<br/>write door, INGEST_TOKEN"]
-        D["Dashboard<br/>DASHBOARD_TOKEN"]
+        D["/dashboard<br/>WorkOS sign-in"]
         R["Refresh groups<br/>derivation pipeline"]
     end
 
@@ -226,15 +226,17 @@ projection.
 
 ## Operations
 
-- **Secrets** (Fly): `DATABASE_URL` `DASHBOARD_TOKEN` `INGEST_TOKEN` `OPENAI_API_KEY`;
+- **Secrets** (Fly): `DATABASE_URL` `INGEST_TOKEN` `OPENAI_API_KEY` `PUBLIC_URL`
+  `MCP_AUTH_ISSUER` `MCP_AUTH_ORG` `WORKOS_CLIENT_ID` `WORKOS_API_KEY` `WORKOS_COOKIE_PASSWORD`;
   local `.env`: `INGEST_TOKEN` (for the hook)
 - **Deploy**: `fly deploy --ha=false` — schema migrates automatically at startup
 - **Cost**: Fly under $2 (suspend) + Neon $0 + OpenAI a few dozen cents per month
 
 ## Known limitations / open items
 
-- **`/mcp` is unauthenticated** — anyone with the URL can read stored conversations.
-  The price of claude.ai connector compatibility; an unresolved security item
+- **Access is all or nothing** — `/mcp` and the dashboard let in only members of one
+  WorkOS organization, and each member sees the whole archive: conversations have no
+  owner yet. A dashboard sign-in lasts 12 hours, so removing a member takes up to that long
 - claude.ai-side verbatim text can't be guaranteed (the model retypes it; the client
   offers no raw-transcript channel)
 - A conversation mixing two topics lands between them — segmentation is deferred

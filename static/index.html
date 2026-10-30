@@ -247,8 +247,13 @@ function renderReopen(c) {
       style="color:#8db4f5">↗ Open original conversation</a>`;
   } else {
     el.innerHTML = `<code style="background:#262b33;padding:4px 8px;border-radius:6px">${esc(c.source_url)}</code>
-      <button onclick="navigator.clipboard.writeText('${esc(c.source_url)}');this.textContent='copied'"
-      style="margin-left:8px;padding:4px 10px">copy</button>`;
+      <button style="margin-left:8px;padding:4px 10px">copy</button>`;
+    // Hand the text to the clipboard from JS, not through an onclick attribute: the browser turns
+    // esc()'s &#39; back into a quote there, so a crafted source_url would run as script
+    el.querySelector('button').onclick = function () {
+      navigator.clipboard.writeText(c.source_url);
+      this.textContent = 'copied';
+    };
   }
 }
 

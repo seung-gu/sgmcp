@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import time
@@ -5,8 +6,8 @@ from functools import cache
 from mcp.server.auth.provider import AccessToken, TokenVerifier
 from mcp.server.auth.settings import AuthSettings
 import jwt
-from cryptography.fernet import InvalidToken
-from workos import WorkOSClient
+from cryptography.fernet import Fernet, InvalidToken
+from workos import WorkOSClient, WorkOSError
 from workos.session import seal_data, unseal_data
 
 
@@ -17,6 +18,9 @@ AUTH_ORG = os.environ.get("MCP_AUTH_ORG")   # WorkOS organization (org_...) that
 
 
 # --- /mcp: check the AuthKit access tokens MCP clients bring (this server as resource server) ---
+# MCP authorization (OAuth 2.1):
+# https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization
+# https://daleseo.com/mcp-auth/
 
 class AuthKitVerifier(TokenVerifier):
     """Accepts tokens signed by our AuthKit for this server, from members of AUTH_ORG only."""
@@ -26,8 +30,13 @@ class AuthKitVerifier(TokenVerifier):
         self.jwks = jwt.PyJWKClient(f"{AUTH_ISSUER}/oauth2/jwks")
 
     async def verify_token(self, token: str) -> AccessToken | None:
+        # The bearer middleware hands over every route's bearer value, the ingest hook's INGEST_TOKEN
+        # on /api/ingest included: a value that isn't a JWT at all is not ours to log
+        if token.count(".") != 2:
+            return None
         try:
-            key = self.jwks.get_signing_key_from_jwt(token)   # pick the public key matching the header's kid
+            # pick the public key matching the header's kid; fetching the key set blocks, so off the event loop
+            key = await asyncio.to_thread(self.jwks.get_signing_key_from_jwt, token)
             claims = jwt.decode(
                 token,
                 key.key,
@@ -64,13 +73,18 @@ def fastmcp_options() -> dict:
     }
 
 
-# --- Browser sign-in for the dashboard: fetch a token from AuthKit (this server as OAuth client) ---
-# OAuth 2.1 protocol:
-# https://modelcontextprotocol.io/specification/2026-07-28/basic/authorization
-# https://daleseo.com/mcp-auth/
+# --- Browser sign-in for the dashboard (this server as OAuth client): sign in through AuthKit,
+# check the organization once, then keep our own sealed session ---
+# OAuth 2.1 code flow: https://datatracker.ietf.org/doc/draft-ietf-oauth-v2-1/
+# PKCE: https://www.rfc-editor.org/rfc/rfc7636
 
 _COOKIE_PASSWORD = os.environ.get("WORKOS_COOKIE_PASSWORD", "")
 SIGN_IN_HOURS = 12  # a member removed from the organization keeps access until this runs out
+
+try:
+    Fernet(_COOKIE_PASSWORD)
+except ValueError:  # unset, or not a Fernet key: every sign-in and session check would answer 500
+    logging.getLogger(__name__).warning("WORKOS_COOKIE_PASSWORD is not a Fernet key: dashboard sign-in fails")
 
 
 class SignInError(Exception):
@@ -98,11 +112,16 @@ def finish_sign_in(started_sealed: str, code: str | None, state: str | None) -> 
         started = unseal_data(started_sealed, _COOKIE_PASSWORD)  # unseal what start_sign_in kept
     except InvalidToken as e:
         raise SignInError("No sign-in under way in this browser.") from e
-    if not code or state != started["state"]:
+    # .get: a session cookie put in the login cookie's place unseals too, with no state in it
+    if not code or not state or state != started.get("state"):
         raise SignInError("Not the sign-in this browser started.")
-    result = _workos().user_management.authenticate_with_code_pkce(
-        code=code, code_verifier=started["code_verifier"]
-    )
+    try:
+        result = _workos().user_management.authenticate_with_code_pkce(
+            code=code, code_verifier=started["code_verifier"]
+        )
+    except WorkOSError as e:  # a used or expired code (back button, reload), or WorkOS unreachable
+        logging.getLogger(__name__).warning("sign-in code exchange failed: %s", e)
+        raise SignInError("WorkOS could not finish the sign-in. Start again from /dashboard.") from e
     if not approved(result.organization_id):
         raise SignInError("Signed in, but not approved yet.")
     return seal_data({"until": time.time() + SIGN_IN_HOURS * 3600}, _COOKIE_PASSWORD)
@@ -114,4 +133,4 @@ def session_valid(session_sealed: str) -> bool:
         session = unseal_data(session_sealed, _COOKIE_PASSWORD)
     except InvalidToken:  # no cookie, or one this server did not seal
         return False
-    return session["until"] > time.time()
+    return session.get("until", 0) > time.time()  # a login cookie in its place has no "until"

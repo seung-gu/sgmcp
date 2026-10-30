@@ -49,12 +49,16 @@ def register(mcp) -> None:
         except auth.SignInError as e:
             return HTMLResponse(str(e), status_code=403)
         response = RedirectResponse("/dashboard")
-        response.set_cookie("sgmcp_session", session, max_age=auth.SIGN_IN_HOURS * 3600, **_COOKIE) # session state
+        response.set_cookie("sgmcp_session", session, max_age=auth.SIGN_IN_HOURS * 3600, **_COOKIE)
         response.delete_cookie("sgmcp_login")
         return response
 
+    @mcp.custom_route("/", methods=["GET"])
+    async def root(request: Request):
+        return RedirectResponse("/dashboard")  # the dashboard used to live here: keep old links working
+
     @mcp.custom_route("/dashboard", methods=["GET"])
-    async def index(request: Request):
+    async def dashboard_page(request: Request):
         if not _signed_in(request):
             return RedirectResponse("/auth/login")
         return HTMLResponse((_STATIC_DIR / "index.html").read_text())
