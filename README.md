@@ -88,7 +88,7 @@ DATABASE_URL="postgresql://..." uv run python server.py    # serves on port 8000
 ```
 
 Set `PORT` to use another port. The MCP endpoint is `http://localhost:8000/mcp`, and
-the dashboard is at `http://localhost:8000/?token=<DASHBOARD_TOKEN>`. Smoke test:
+the dashboard is at `http://localhost:8000/dashboard`, behind a WorkOS sign-in. Smoke test:
 
 ```bash
 curl -X POST http://localhost:8000/mcp \
@@ -102,7 +102,11 @@ curl -X POST http://localhost:8000/mcp \
 | Variable | Purpose |
 |---|---|
 | `DATABASE_URL` | Postgres connection string (e.g. Neon). Needed by the archive tools and the dashboard |
-| `DASHBOARD_TOKEN` | Dashboard access token. The dashboard is off when unset |
+| `PUBLIC_URL` | The server's public address (default `http://localhost:8000`). The MCP resource and the sign-in callback are built from it |
+| `MCP_AUTH_ISSUER` | WorkOS AuthKit domain. When set, `/mcp` takes only AuthKit access tokens; unset, `/mcp` is open |
+| `MCP_AUTH_ORG` | WorkOS organization whose members may use `/mcp` and the dashboard: adding someone to it is the approval |
+| `WORKOS_CLIENT_ID`, `WORKOS_API_KEY` | The WorkOS application the dashboard signs in through; register `<PUBLIC_URL>/auth/callback` as its redirect URI. Required for the dashboard |
+| `WORKOS_COOKIE_PASSWORD` | Fernet key that seals the dashboard's sign-in cookies. Required for the dashboard |
 | `INGEST_TOKEN` | Auth token for `POST /api/ingest`, used by the Claude Code hook |
 | `OPENAI_API_KEY` | Embeddings, meaning search and metadata generation. List and keyword search work without it |
 | `ARCHIVE_LANGUAGE` | Language of all derived text: titles, tags, summaries, group names (default: Korean) |
@@ -115,6 +119,10 @@ and the connection fails.
 
 - **Claude Code**: `claude mcp add --transport http sgmcp https://<your-app>.fly.dev/mcp`
 - **claude.ai**: Settings → Connectors → Add custom connector → `https://<your-app>.fly.dev/mcp`
+- **Signing in**: with `MCP_AUTH_ISSUER` set, a client opens a WorkOS sign-in the first time
+  it connects (in Claude Code, run `/mcp` and pick the server). Only members of
+  `MCP_AUTH_ORG` get in. The auto-save hook below is not affected: `/api/ingest` keeps
+  its own `INGEST_TOKEN`.
 - **Claude Code auto-save**: register `hooks/save_conversation.py` as a global Stop
   hook and put `INGEST_TOKEN` in the local `.env`. After every turn it sends the
   session's last 20 messages to `/api/ingest`, and the whole session only when the
@@ -165,6 +173,5 @@ fly deploy --ha=false                                      # Fly.io; the schema 
 
 ## Future Ideas
 
-- [ ] Authentication on the `/mcp` endpoint
 - [ ] Split conversations that mix two topics, so each part lands in its own group
 - [ ] "Conversations similar to this one" on the dashboard, by running meaning search with the conversation's card

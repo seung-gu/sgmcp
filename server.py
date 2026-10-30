@@ -8,16 +8,19 @@ from typing import Annotated
 from mcp.server.fastmcp import FastMCP
 from pydantic import BaseModel, Field
 
+import auth
 import dashboard
 import db
 import grouping
 import ingest
+
 
 mcp = FastMCP(
     "sgmcp",
     host="0.0.0.0",
     port=int(os.environ.get("PORT", 8000)),
     stateless_http=True,
+    **auth.fastmcp_options(),
 )
 
 

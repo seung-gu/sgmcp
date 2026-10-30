@@ -8,7 +8,9 @@ dependencies = [
     "numpy>=2.5.1",
     "psycopg[binary]>=3.3.4",
     "pydantic-ai-slim[openai]>=2.9.1",
+    "pyjwt[crypto]>=2.13.0",
     "scipy>=1.18.1",
+    "workos>=10.6.0",
 ]
 
 [dependency-groups]
