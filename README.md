@@ -88,7 +88,7 @@ DATABASE_URL="postgresql://..." uv run python server.py    # serves on port 8000
 ```
 
 Set `PORT` to use another port. The MCP endpoint is `http://localhost:8000/mcp`, and
-the dashboard is at `http://localhost:8000/?token=<DASHBOARD_TOKEN>`. Smoke test:
+the dashboard is at `http://localhost:8000/dashboard`, behind a WorkOS sign-in. Smoke test:
 
 ```bash
 curl -X POST http://localhost:8000/mcp \
@@ -102,7 +102,11 @@ curl -X POST http://localhost:8000/mcp \
 | Variable | Purpose |
 |---|---|
 | `DATABASE_URL` | Postgres connection string (e.g. Neon). Needed by the archive tools and the dashboard |
-| `DASHBOARD_TOKEN` | Dashboard access token. The dashboard is off when unset |
+| `PUBLIC_URL` | The server's public address (default `http://localhost:8000`). The MCP resource and the sign-in callback are built from it |
+| `MCP_AUTH_ISSUER` | WorkOS AuthKit domain. When set, `/mcp` takes only AuthKit access tokens; unset, `/mcp` is open |
+| `MCP_AUTH_ORG` | WorkOS organization whose members may use `/mcp` and the dashboard: adding someone to it is the approval |
+| `WORKOS_CLIENT_ID`, `WORKOS_API_KEY` | The WorkOS application the dashboard signs in through |
+| `WORKOS_COOKIE_PASSWORD` | Fernet key that seals the dashboard's sign-in cookie |
 | `INGEST_TOKEN` | Auth token for `POST /api/ingest`, used by the Claude Code hook |
 | `OPENAI_API_KEY` | Embeddings, meaning search and metadata generation. List and keyword search work without it |
 | `ARCHIVE_LANGUAGE` | Language of all derived text: titles, tags, summaries, group names (default: Korean) |

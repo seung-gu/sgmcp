@@ -98,15 +98,14 @@
 </div>
 
 <script>
-const token = new URLSearchParams(location.search).get('token') || '';
 let projByKey = {};
 
 const esc = s => (s ?? '').toString().replace(/[&<>"']/g,
   c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 
 async function api(path, opts) {
-  const sep = path.includes('?') ? '&' : '?';
-  const res = await fetch(path + sep + 'token=' + encodeURIComponent(token), opts);
+  const res = await fetch(path, opts);
+  if (res.status === 403) location.href = '/auth/login';  // signed out, or the sign-in ran out
   // a crash or a proxy timeout answers in plain text, which res.json() can't read
   const body = await res.json().catch(() => ({ error: `${res.status} ${res.statusText}` }));
   if (!res.ok) throw new Error(body.error || res.status);

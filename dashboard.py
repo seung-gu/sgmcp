@@ -1,24 +1,24 @@
 # Dashboard web routes — served by the same process as MCP, kept in their own module
 
 import logging
-import os
-import secrets
 from pathlib import Path
 
 from starlette.concurrency import run_in_threadpool
 from starlette.requests import Request
-from starlette.responses import HTMLResponse, JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse, RedirectResponse
 
+import auth
 import db
 import grouping
 
 _STATIC_DIR = Path(__file__).parent / "static"
+# HttpOnly: page scripts can't read it; Secure: https only (local http excepted);
+# SameSite=Lax: another site's POST doesn't carry it
+_COOKIE = {"httponly": True, "secure": auth.PUBLIC_URL.startswith("https://"), "samesite": "lax"}
 
 
-def _authorized(request: Request) -> bool:
-    expected = os.environ.get("DASHBOARD_TOKEN", "")
-    given = request.query_params.get("token", "")
-    return bool(expected) and secrets.compare_digest(given, expected)
+def _signed_in(request: Request) -> bool:
+    return auth.session_valid(request.cookies.get("sgmcp_session", ""))
 
 
 def _unauthorized() -> JSONResponse:
@@ -26,23 +26,48 @@ def _unauthorized() -> JSONResponse:
 
 
 def register(mcp) -> None:
-    """Register the dashboard routes on the FastMCP app."""
+    """Register the dashboard routes, and the WorkOS sign-in in front of them, on the FastMCP app."""
 
-    @mcp.custom_route("/", methods=["GET"])
+    @mcp.custom_route("/auth/login", methods=["GET"])
+    async def login(request: Request):
+        # OAuth 2.1 sign-in: WorkOS signs the user in, then sends the browser to /auth/callback
+        url, started = auth.start_sign_in()
+        response = RedirectResponse(url)
+        # state and the PKCE verifier wait in a sealed cookie until the browser comes back
+        response.set_cookie("sgmcp_login", started, max_age=600, **_COOKIE)
+        return response
+
+    @mcp.custom_route("/auth/callback", methods=["GET"])
+    async def callback(request: Request):
+        try:
+            session = await run_in_threadpool(
+                auth.finish_sign_in,
+                request.cookies.get("sgmcp_login", ""),
+                request.query_params.get("code"),
+                request.query_params.get("state"),
+            )
+        except auth.SignInError as e:
+            return HTMLResponse(str(e), status_code=403)
+        response = RedirectResponse("/dashboard")
+        response.set_cookie("sgmcp_session", session, max_age=auth.SIGN_IN_HOURS * 3600, **_COOKIE) # session state
+        response.delete_cookie("sgmcp_login")
+        return response
+
+    @mcp.custom_route("/dashboard", methods=["GET"])
     async def index(request: Request):
-        if not _authorized(request):
-            return _unauthorized()
+        if not _signed_in(request):
+            return RedirectResponse("/auth/login")
         return HTMLResponse((_STATIC_DIR / "index.html").read_text())
 
     @mcp.custom_route("/api/conversations", methods=["GET"])
     async def api_conversations(request: Request):
-        if not _authorized(request):
+        if not _signed_in(request):
             return _unauthorized()
         return JSONResponse(await run_in_threadpool(db.list_conversations, 200))
 
     @mcp.custom_route("/api/search", methods=["GET"])
     async def api_search(request: Request):
-        if not _authorized(request):
+        if not _signed_in(request):
             return _unauthorized()
         query = request.query_params.get("q", "").strip()
         if not query:
@@ -56,7 +81,7 @@ def register(mcp) -> None:
 
     @mcp.custom_route("/api/conversation/{key}", methods=["GET"])
     async def api_conversation(request: Request):
-        if not _authorized(request):
+        if not _signed_in(request):
             return _unauthorized()
         row = await run_in_threadpool(db.get_conversation, request.path_params["key"])
         if row is None:
@@ -65,13 +90,13 @@ def register(mcp) -> None:
 
     @mcp.custom_route("/api/projection", methods=["GET"])
     async def api_projection(request: Request):
-        if not _authorized(request):
+        if not _signed_in(request):
             return _unauthorized()
         return JSONResponse(await run_in_threadpool(db.projection_rows))
 
     @mcp.custom_route("/api/refresh", methods=["POST"])
     async def api_refresh(request: Request):
-        if not _authorized(request):
+        if not _signed_in(request):
             return _unauthorized()
         try:
             stats = await run_in_threadpool(grouping.refresh)
