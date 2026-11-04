@@ -109,14 +109,35 @@ def _connect() -> psycopg.Connection:
     global _schema_ready
     conn = psycopg.connect(os.environ["DATABASE_URL"], row_factory=dict_row)
     if not _schema_ready:
-        # One transaction per statement: ALTER TABLE ... IF NOT EXISTS locks the whole
-        # table even when there is nothing to add, and holding that lock while waiting
-        # on the next table deadlocked a refresh that was writing chunks (2026-10-29).
-        for statement in _SCHEMA:
-            conn.execute(statement)
-            conn.commit()
+        _migrate(conn)
         _schema_ready = True
     return conn
+
+
+def _migrate(conn: psycopg.Connection) -> None:
+    """Run the _SCHEMA statements not yet recorded in schema_migrations, and record them.
+
+    ALTER TABLE ... IF NOT EXISTS locks the whole table even when there is nothing to
+    add, so running the whole list on every start made each process queue behind any
+    long write; a refresh writing chunks deadlocked this way (2026-10-29). A recorded
+    statement never runs again. Statements are keyed by their text: an edited one runs
+    once more as a new one, which IF NOT EXISTS keeps harmless.
+    """
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS schema_migrations"
+        " (statement TEXT PRIMARY KEY, applied_at TIMESTAMPTZ NOT NULL DEFAULT now())"
+    )
+    applied = {r["statement"] for r in conn.execute("SELECT statement FROM schema_migrations")}
+    conn.commit()
+    for statement in _SCHEMA:
+        if statement in applied:
+            continue
+        conn.execute(statement)
+        # two processes starting together may both get here; IF NOT EXISTS and DO NOTHING let both through
+        conn.execute(
+            "INSERT INTO schema_migrations (statement) VALUES (%s) ON CONFLICT DO NOTHING", (statement,)
+        )
+        conn.commit()  # one transaction per statement: never hold one table's lock while waiting on the next
 
 
 def _isoformat(row: dict) -> dict:
