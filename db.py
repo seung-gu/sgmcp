@@ -480,11 +480,18 @@ def _around(text: str, query: str) -> str:
     return text[start : start + EXCERPT_CHARS]
 
 
+def _like_pattern(query: str) -> str:
+    """%query% for ILIKE, matching the query's own \\, % and _ as plain characters.
+    Backslash first, or the escapes added for % and _ would be doubled."""
+    escaped = query.replace("\\", "\\\\").replace("%", r"\%").replace("_", r"\_")
+    return f"%{escaped}%"
+
+
 def search_conversations(query: str, limit: int) -> list[dict]:
     """Keyword search, most recently updated first. Each result also says where in
     the conversation the keyword occurs: every message containing it, grouped into
     sections, so an older stretch is listed even when a newer one exists."""
-    pattern = f"%{query}%"
+    pattern = _like_pattern(query)
     with _connect() as conn:
         rows = conn.execute(
             f"""

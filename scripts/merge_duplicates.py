@@ -165,8 +165,9 @@ def move_answers(conn, removed: dict[str, tuple[str, int]]) -> None:
             if body.get("quote"):
                 found = conn.execute(
                     "SELECT m.idx FROM messages m JOIN conversations c ON c.id = m.conversation_id"
-                    " WHERE c.conversation_key = %s AND m.content LIKE %s ORDER BY m.idx LIMIT 1",
-                    (body["conversation_key"], f"%{body['quote']}%"),
+                    # strpos, not LIKE: the quote is plain text, and LIKE would read its % and _ as wildcards
+                    " WHERE c.conversation_key = %s AND strpos(m.content, %s) > 0 ORDER BY m.idx LIMIT 1",
+                    (body["conversation_key"], body["quote"]),
                 ).fetchone()
                 body["idx"] = found["idx"] if found else None
             conn.execute("UPDATE eval_answers SET body = %s WHERE id = %s", (json.dumps(body, ensure_ascii=False), r["id"]))
