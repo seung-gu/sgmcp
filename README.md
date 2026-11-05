@@ -1,177 +1,113 @@
+[English](README.md) | [한국어](docs/ko/README.md)
+
 # sgmcp
 
-A personal MCP server that gives my AI assistants a shared, long-term memory. It
-collects my conversations from claude.ai, Claude Code and ChatGPT into one Postgres
-database, and any of those assistants can look them up later.
+sgmcp is a personal MCP server that gives your AI apps one shared memory. It saves your conversations from claude.ai, ChatGPT and Claude Code into one archive while you talk, and any of those apps can search the archive and read from it later.
 
+![Python](https://img.shields.io/badge/Python-3.12-3776AB?logo=python&logoColor=white)
+![uv](https://img.shields.io/badge/uv-package%20manager-DE5FE9?logo=uv&logoColor=white)
+![MCP](https://img.shields.io/badge/MCP-1.28%20FastMCP-111111?logo=modelcontextprotocol&logoColor=white)
+![Starlette](https://img.shields.io/badge/Starlette-1.3-009688)
+![pydantic-ai](https://img.shields.io/badge/pydantic--ai-2.9-E92063?logo=pydantic&logoColor=white)
+<br>
+![PostgreSQL](https://img.shields.io/badge/PostgreSQL-18-4169E1?logo=postgresql&logoColor=white)
+![Neon](https://img.shields.io/badge/Neon-serverless%20Postgres-00E599?logo=neon&logoColor=black)
+![pgvector](https://img.shields.io/badge/pgvector-0.8%20HNSW-4B5563)
+![OpenAI](https://img.shields.io/badge/OpenAI-embeddings%20%C2%B7%20gpt--4.1--mini-412991?logo=openai&logoColor=white)
+![SciPy](https://img.shields.io/badge/SciPy-1.18-8CAAE6?logo=scipy&logoColor=white)
+![Plotly](https://img.shields.io/badge/Plotly.js-2.35-3F4F75?logo=plotly&logoColor=white)
+<br>
+![Fly.io](https://img.shields.io/badge/Fly.io-fra-8B5CF6?logo=flydotio&logoColor=white)
+![Docker](https://img.shields.io/badge/Docker-2496ED?logo=docker&logoColor=white)
+![WorkOS](https://img.shields.io/badge/WorkOS-AuthKit-6363F1)
+![OAuth](https://img.shields.io/badge/OAuth-2.1%20%2B%20PKCE-4B5563)
+
+![Claude and ChatGPT apps, the Claude Code hook and a browser call the sgmcp server on Fly.io, which stores everything in Neon Postgres and calls OpenAI and WorkOS](docs/diagrams/architecture.png)
+
+## Features
+| Feature | What it does |
+|---|---|
+| Saves on its own | claude.ai and ChatGPT save each turn through MCP tools right after they answer. Claude Code saves through a Stop hook that spends no model tokens |
+| Recalls from any app | Ask ChatGPT about something you worked out in claude.ai or Claude Code. It searches the archive, by keyword or by meaning, and answers with that history |
+| Opens the right spot | A search result points to the stretch of messages where the topic came up, so the app reads that part instead of the whole conversation |
+| Back to the source | Each conversation keeps its claude.ai chat URL, or the `claude --resume` command of its Claude Code session |
+| Dashboard | Titles, tags and summaries written by the server, topic groups on a 3D map, keyword and meaning search |
+| Sign-in | WorkOS OAuth on `/mcp` and on the dashboard. Only members of one WorkOS organization get in |
+
+## Save in one app, recall in another
+![A claude.ai conversation is saved to sgmcp after every answer; later, ChatGPT searches sgmcp, opens the matching stretch and answers with that history](docs/diagrams/save-and-recall.png)
+
+| App | Saves | Recalls |
+|---|---|---|
+| claude.ai | `save_conversation` once, then `append_messages` after every answer, asked for by a few lines in its personal preferences | `search_conversations_by_meaning`, `search_conversations`, `get_conversation` |
+| ChatGPT | the same tools through the sgmcp connector, asked for by the same lines in its instructions | the same tools |
+| Claude Code | a global Stop hook posts the session transcript to `/api/ingest`: no model tokens, the text exactly as written | the same tools, after `claude mcp add` |
+
+The lines to paste and the hook setup: [Setup § Auto-save](docs/en/setup.md#auto-save).
+
+## How search finds the right stretch
+![Each save cuts the conversation into passages and embeds the new ones; a question is matched to each conversation's best passage, grouped into sections, and only that stretch is read](docs/diagrams/search.png)
+
+- Keyword search matches exact strings, such as an error message or a function name.
+- Meaning search finds a topic when you no longer remember the words, in any language. Each conversation is cut into 1,500-character passages, and it ranks by its best passage.
+- Each result lists sections: where in the conversation the match sits, and when it was said. `get_conversation(start=…)` reads from there, a page of about 20,000 characters at a time.
+
+## Dashboard
 ![The sgmcp dashboard: topic groups, the 3D map of conversations and the conversation list, with personal text blurred](docs/dashboard.png)
 
-## What This Does
+`/dashboard`, after a WorkOS sign-in:
 
-My conversations with AI assistants were spread across several apps, and each
-assistant knew only its own. sgmcp keeps them in one place and hands them back: an
-assistant can search earlier conversations about my career, past decisions and other
-projects, and answer with that history instead of starting from zero.
+- Topic groups under big categories, named by an LLM, and a 3D map of every conversation
+- Keyword and meaning search, the conversation list, and a reading view with the link or resume command back to the source
+- The Refresh groups button writes new titles, tags and summaries only for conversations whose content has moved on. When nothing has changed, it makes no LLM calls
 
-Each client sends the conversation text, unchanged, to the server. The server writes
-the titles, tags, summaries and topic groups, and a dashboard lets me browse and search
-the archive and see the groups on a 3D map.
-
-## How It Works
-
-- **Saving.** claude.ai (and ChatGPT, when connected) saves through MCP tools after
-  every answer. Claude Code saves through a Stop hook that reads the local session
-  transcript, so it spends no model tokens.
-- **Recalling.** Any connected assistant can look up earlier conversations: by keyword
-  with `search_conversations`, or by topic with `search_conversations_by_meaning` when
-  it doesn't know the exact words. Results say where in a conversation the match
-  sits, so `get_conversation` can open that stretch instead of the whole
-  conversation: the summary first, the verbatim messages when it needs the details.
-- **Reopening.** Each conversation keeps a way back to the app it came from. Claude
-  Code stores a `cd <project> && claude --resume <session-id>` command, and claude.ai
-  stores the chat URL, which the assistant asks the user to paste. The dashboard shows
-  the URL as a link and the command with a copy button, and the archive tools return
-  it too, so a conversation found later can be continued where it started. The resume
-  command needs the session's local transcript, so it works on the machine that ran
-  the session.
-- **Storing.** The verbatim messages live in Postgres, one row per message, so saving
-  a turn writes only the new rows. Every other column is derived from them and can
-  be rebuilt.
-- **Deriving.** The dashboard's "Refresh groups" button averages each conversation's
-  search passages into one vector (weighted by length, no new embedding calls) and
-  checks which conversations have drifted from their last summary. Only those get new titles,
-  tags and summaries from the LLM. Clustering then groups conversations by topic, an
-  LLM names the groups and shelves them under big categories it chooses, and PCA
-  places them on the 3D map. With no drift and the same groups as before, a refresh
-  makes no LLM calls.
-- **Searching.** Text search matches exact strings, such as an error message. Meaning
-  search cuts each conversation's text every 1,500 characters, embeds each passage
-  with the 200 characters before it, and ranks a conversation by its best-matching
-  passage. The server indexes new messages in the background right after each save;
-  passages are cut in text order, so only the last passage and any new ones are
-  embedded.
-
-[ARCHITECTURE.md](ARCHITECTURE.md) has the diagrams, the data model and the
-measurements behind each tuned value.
-
-### MCP tools
-
-| Tool | What it does |
+## MCP tools
+| Tool | Does |
 |---|---|
-| `save_conversation(messages, source?, project?, key?)` | Create a conversation (the server issues a `cw-`+UUID key when none is given), or overwrite one to repair it |
-| `append_messages(key, new_messages, project?, source_url?)` | Append the messages not saved yet: the latest turn, plus any turn whose save was skipped. Messages already saved are stored once. `source_url` stores the chat's address for reopening |
-| `get_conversation(key, full=False, start?, count?)` | Load one conversation, summary first. `full=true`, `start` or `count` adds the verbatim messages one page (about 20,000 characters) at a time: from `start`, or the most recent when omitted, so a short conversation comes back whole. `count` caps the number of messages; `next_start`/`prev_start` keep reading. Each message carries its time (`at`) |
-| `list_conversations(limit)` | Recent conversations, without message bodies |
-| `search_conversations(query, limit)` | Keyword search over title, summary and content; each result lists where the keyword occurs (`sections`, newest first) |
-| `search_conversations_by_meaning(query, limit)` | Meaning search for a topic whose exact words are unknown; each result lists the stretches where it is discussed (`sections`). New messages become searchable seconds after they are saved |
+| `save_conversation` | creates a conversation; the server issues its key |
+| `append_messages` | adds the turns not saved yet |
+| `get_conversation` | the summary first, then the verbatim messages a page at a time |
+| `list_conversations` | recent conversations, without message bodies |
+| `search_conversations` | keyword search, with the sections where the keyword occurs |
+| `search_conversations_by_meaning` | meaning search, with the sections where the topic is discussed |
 
-## Tech Stack
+Arguments and paging: [MCP tools](docs/en/tools.md).
 
-- **Server**: Python with FastMCP over streamable HTTP, so claude.ai and Claude Code
-  connect to it as a remote MCP server
-- **Database**: Neon Postgres with pgvector, one store for the text, the vectors and
-  the HNSW index behind meaning search
-- **LLM**: OpenAI `text-embedding-3-small` for embeddings; through pydantic-ai,
-  `gpt-4.1-mini` for titles, tags and summaries and `gpt-5.4-mini` for the group
-  tree, with schema and language checks that retry on failure
-- **Dashboard**: a single HTML page, with Plotly for the 3D map
-- **Hosting**: Fly.io in Frankfurt, suspended when idle. Running costs: Fly under $2,
-  Neon $0 and OpenAI a few dozen cents a month
+## Stack
+| Area | Used | For |
+|---|---|---|
+| Server | Python 3.12, uv, MCP SDK 1.28 (FastMCP, streamable HTTP, stateless), Starlette | MCP tools, ingest API, dashboard |
+| Database | Neon Postgres 18, pgvector 0.8 (HNSW), pg_trgm, psycopg 3 | messages, search passages, groups |
+| AI | OpenAI `text-embedding-3-small`; `gpt-4.1-mini` and `gpt-5.4-mini` through pydantic-ai | embeddings; titles, tags, summaries, group names |
+| Grouping | NumPy, SciPy | average-linkage clustering, 3D coordinates (PCA) |
+| Sign-in | WorkOS AuthKit, PyJWT | OAuth on `/mcp`, dashboard sign-in |
+| Dashboard | one HTML page, Plotly.js 2.35 | groups, 3D map, search |
+| Hosting | Fly.io `fra`, shared-cpu-1x, 512 MB, suspended when idle | production server |
 
-## Getting Started
+Running costs: Fly under $2, Neon $0 and OpenAI a few dozen cents a month.
 
-Requires [uv](https://docs.astral.sh/uv/).
-
+## Quick start
 ```bash
-uv sync                                                    # install dependencies
-DATABASE_URL="postgresql://..." uv run python server.py    # serves on port 8000
+uv sync
+DATABASE_URL="postgresql://..." uv run python server.py   # MCP at http://localhost:8000/mcp
 ```
 
-Set `PORT` to use another port. The MCP endpoint is `http://localhost:8000/mcp`, and
-the dashboard is at `http://localhost:8000/dashboard`, behind a WorkOS sign-in. Smoke test:
+Environment variables, connecting each app, the Claude Code hook and deploying: [Setup](docs/en/setup.md).
 
-```bash
-curl -X POST http://localhost:8000/mcp \
-  -H "Content-Type: application/json" \
-  -H "Accept: application/json, text/event-stream" \
-  -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"test","version":"0"}}}'
-```
-
-### Environment variables
-
-| Variable | Purpose |
+## Docs
+| Doc | About |
 |---|---|
-| `DATABASE_URL` | Postgres connection string (e.g. Neon). Needed by the archive tools and the dashboard |
-| `PUBLIC_URL` | The server's public address (default `http://localhost:8000`). The MCP resource and the sign-in callback are built from it |
-| `MCP_AUTH_ISSUER` | WorkOS AuthKit domain. When set, `/mcp` takes only AuthKit access tokens; unset, `/mcp` is open |
-| `MCP_AUTH_ORG` | WorkOS organization whose members may use `/mcp` and the dashboard: adding someone to it is the approval |
-| `WORKOS_CLIENT_ID`, `WORKOS_API_KEY` | The WorkOS application the dashboard signs in through; register `<PUBLIC_URL>/auth/callback` as its redirect URI. Required for the dashboard |
-| `WORKOS_COOKIE_PASSWORD` | Fernet key that seals the dashboard's sign-in cookies. Required for the dashboard |
-| `INGEST_TOKEN` | Auth token for `POST /api/ingest`, used by the Claude Code hook |
-| `OPENAI_API_KEY` | Embeddings, meaning search and metadata generation. List and keyword search work without it |
-| `ARCHIVE_LANGUAGE` | Language of all derived text: titles, tags, summaries, group names (default: Korean) |
-| `EVAL_DATABASE_URL` | Connection string of the eval branch (see Evaluating search). Only the eval and its pre-push hook use it |
+| [Setup](docs/en/setup.md) | running locally, environment variables, connecting apps, auto-save, the Claude Code hook, deploying |
+| [MCP tools](docs/en/tools.md) | every tool, its arguments, sections and paging |
+| [Evaluating search](docs/en/eval.md) | the eval branch, the two evals, baselines, the pre-push hook |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | save flows, the refresh pipeline, search internals, data model, measured values |
 
-### Connecting a client
+## What I learned
+- **Keep the verbatim text as the only truth.** I reset and recomputed every derived column several times during development and lost nothing, because the raw messages were never touched.
+- **Geometry answers "are these similar?"; an LLM answers "what kind of thing is this?"** Grouping the big categories by geometry alone left 7 near-singleton groups.
+- **Search passages, not averages.** On 66 queries with known answers, the right conversation came first 68% of the time with passages, 59% with single messages and 48% with one average vector per conversation.
+- **Weight by length.** With an equal-weighted mean, short meta remarks made up 37% of the characters but cast 53% of the vote, and misplaced a conversation.
 
-Leave the trailing slash off the endpoint URL: `/mcp/` answers with a 307 redirect
-and the connection fails.
-
-- **Claude Code**: `claude mcp add --transport http sgmcp https://<your-app>.fly.dev/mcp`
-- **claude.ai**: Settings → Connectors → Add custom connector → `https://<your-app>.fly.dev/mcp`
-- **Signing in**: with `MCP_AUTH_ISSUER` set, a client opens a WorkOS sign-in the first time
-  it connects (in Claude Code, run `/mcp` and pick the server). Only members of
-  `MCP_AUTH_ORG` get in. The auto-save hook below is not affected: `/api/ingest` keeps
-  its own `INGEST_TOKEN`.
-- **Claude Code auto-save**: register `hooks/save_conversation.py` as a global Stop
-  hook and put `INGEST_TOKEN` in the local `.env`. After every turn it sends the
-  session's last 20 messages to `/api/ingest`, and the whole session only when the
-  server is further behind; run it with `--backfill` to push past sessions. A session
-  continued as a background job starts as a copy under a new ID, so the same messages
-  get saved twice; `scripts/merge_duplicates.py` finds such copies and, with `--apply`,
-  merges them.
-
-### Evaluating search
-
-`eval/run.py` runs two evals against answers that live, with the archive they were
-written against, on a Neon branch of their own (`EVAL_DATABASE_URL`), so scores don't
-move as conversations arrive and the answers stay out of this public repository:
-
-- **meaning**: meaning search on 62 reviewed questions (paraphrased, pinpoint,
-  whole-conversation, absent-topic)
-- **groups**: the small topic groups, on the conversation pairs two LLM filings agreed on
-
-Neither calls an LLM, so the same code always gets the same numbers. Each run is stored
-on the branch; the run accepted as the baseline is what later runs are compared with,
-and a regression exits 1.
-
-```bash
-uv run --group eval --env-file .env python eval/run.py            # score, compare with the baselines
-uv run --group eval --env-file .env python eval/run.py --accept   # make this run the baseline
-git config core.hooksPath .githooks   # run them before any push that changes search or grouping code
-```
-
-### Deploying
-
-```bash
-docker build -t sgmcp . && docker run -p 8000:8000 sgmcp   # local container
-fly deploy --ha=false                                      # Fly.io; the schema migrates at startup
-```
-
-## What I Learned
-
-- **Keep the verbatim text as the only truth.** I reset and recomputed every derived
-  column several times during development and lost nothing, because the raw messages
-  were never touched.
-- **Geometry answers "are these similar?"; an LLM answers "what kind of thing is
-  this?"** Grouping the big categories by geometry alone left 7 near-singleton groups.
-- **Search passages, not averages.** On 66 queries with known answers, the right
-  conversation came first 68% of the time with passages, 59% with single messages and
-  48% with one average vector per conversation.
-- **Weight by length.** With an equal-weighted mean, short meta remarks made up 37% of
-  the characters but cast 53% of the vote, and misplaced a conversation.
-
-## Future Ideas
-
+## Future ideas
 - [ ] Split conversations that mix two topics, so each part lands in its own group
 - [ ] "Conversations similar to this one" on the dashboard, by running meaning search with the conversation's card
