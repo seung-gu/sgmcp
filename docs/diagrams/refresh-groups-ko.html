@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>그룹 새로고침</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&amp;family=Geist:wght@400;500;600&amp;family=Geist+Mono:wght@400;500;600&amp;family=Noto+Sans+KR:wght@400;500;600&amp;family=Noto+Serif+KR:wght@400&amp;display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --color-paper:   #f5f5f5;
+      --color-ink:     #2d3142;
+      --color-muted:   #4f5d75;
+      --font-sans:     'Geist', 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif;
+      --font-serif:    'Instrument Serif', 'Noto Serif KR', serif;
+      --font-mono:     'Geist Mono', ui-monospace, monospace;
+    }
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 3rem 2rem;
+    }
+    .frame { max-width: 880px; width: 100%; }
+    .eyebrow {
+      font-family: 'Geist', 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif; font-size: 0.8rem; letter-spacing: 0;
+      font-weight: 500;
+      color: var(--color-muted);
+      margin-bottom: 0.5rem;
+    }
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      margin-bottom: 1.5rem;
+    }
+    .diagram-container { width: 100%; overflow-x: auto; }
+    svg { width: 100%; min-width: 760px; display: block; }
+    @media print {
+      .diagram-container { overflow-x: visible; }
+      svg { min-width: 0; }
+    }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">흐름도 · sgmcp</p>
+    <h1>Refresh groups 버튼이 하는 일</h1>
+
+    <div class="diagram-container">
+      <svg viewBox="0 0 760 792" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="refresh-groups-ko-title refresh-groups-ko-desc">
+        <title id="refresh-groups-ko-title">그룹 새로고침</title>
+        <desc id="refresh-groups-ko-desc">새로고침은 대화마다 조각 평균을 내고, 내용이 달라진 대화만 메타데이터를 다시 쓰고, 군집을 다시 만들며, 바뀐 것이 있을 때만 LLM으로 분류 이름 짓기.</desc>
+        <defs>
+          <style>
+            .name  { font-family: 'Geist', 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif; font-size: 12px; font-weight: 600; fill: #2d3142; }
+            .sub   { font-family: 'Geist Mono', ui-monospace, monospace; font-size: 9px; fill: #4f5d75; }
+            .subk  { font-family: 'Geist', 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif; font-size: 12px; fill: #4f5d75; }
+            .lbl   { font-family: 'Geist Mono', ui-monospace, monospace; font-size: 8px; letter-spacing: 0.08em; }
+            .lblk  { font-family: 'Geist', 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif; font-size: 12px; font-weight: 500; }
+            .eye   { font-family: 'Geist Mono', ui-monospace, monospace; font-size: 8px; letter-spacing: 0.14em; fill: #5a6580; }
+            .eyek  { font-family: 'Geist', 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif; font-size: 12px; font-weight: 500; fill: #5a6580; }
+            .op    { font-family: 'Geist Mono', ui-monospace, monospace; font-size: 8px; letter-spacing: 0.12em; fill: #4f5d75; }
+            .guard { font-family: 'Geist Mono', ui-monospace, monospace; font-size: 8px; letter-spacing: 0.04em; fill: #4f5d75; }
+            .guardk { font-family: 'Geist', 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif; font-size: 12px; fill: #4f5d75; }
+            .key   { font-family: 'Geist', 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif; font-size: 11px; fill: #4f5d75; }
+            .keyk  { font-family: 'Geist', 'Noto Sans KR', 'Apple SD Gothic Neo', 'Malgun Gothic', sans-serif; font-size: 12px; fill: #4f5d75; }
+            .note  { font-family: 'Instrument Serif', 'Noto Serif KR', serif; font-size: 14px; font-style: italic; fill: #2d3142; }
+            .notek { font-family: 'Instrument Serif', 'Noto Serif KR', serif; font-size: 14px; fill: #2d3142; }
+            .tag   { font-family: 'Geist Mono', ui-monospace, monospace; font-size: 7px; letter-spacing: 0.08em; fill: rgba(45,49,66,0.80); }
+          </style>
+          <pattern id="dots" width="22" height="22" patternUnits="userSpaceOnUse">
+            <circle cx="1" cy="1" r="0.9" fill="rgba(45,49,66,0.10)"/>
+          </pattern>
+          <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/></marker>
+          <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#bf4520"/></marker>
+          <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polygon points="0 0, 8 3, 0 6" fill="#2e5aa8"/></marker>
+          <marker id="arrow-open" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto"><polyline points="0 0, 8 3, 0 6" fill="none" stroke="#4f5d75" stroke-width="1.2"/></marker>
+        </defs>
+
+        <rect width="100%" height="100%" fill="#f5f5f5"/>
+        <rect width="100%" height="100%" fill="url(#dots)" opacity="0.55"/>
+
+        <line x1="240" y1="88" x2="240" y2="118" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+        <line x1="240" y1="176" x2="240" y2="202" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+        <line x1="340" y1="248" x2="454" y2="248" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+        <line x1="240" y1="292" x2="240" y2="334" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+        <line x1="560" y1="276" x2="560" y2="334" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+        <line x1="456" y1="364" x2="346" y2="364" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+        <line x1="240" y1="392" x2="240" y2="430" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+        <line x1="340" y1="476" x2="454" y2="476" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+        <line x1="240" y1="520" x2="240" y2="558" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+        <line x1="240" y1="616" x2="240" y2="646" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+        <rect x="386" y="226" width="24" height="16" rx="2" fill="#f5f5f5"/>
+        <text x="398" y="238" class="lblk" text-anchor="middle" fill="#4f5d75">예</text>
+
+        <rect x="248" y="306" width="48" height="16" rx="2" fill="#f5f5f5"/>
+        <text x="272" y="318" class="lblk" text-anchor="middle" fill="#4f5d75">아니오</text>
+
+        <rect x="374" y="454" width="48" height="16" rx="2" fill="#f5f5f5"/>
+        <text x="398" y="466" class="lblk" text-anchor="middle" fill="#4f5d75">아니오</text>
+
+        <rect x="248" y="532" width="24" height="16" rx="2" fill="#f5f5f5"/>
+        <text x="260" y="544" class="lblk" text-anchor="middle" fill="#4f5d75">예</text>
+
+        <rect x="136" y="32" width="208" height="56" rx="20" fill="#f5f5f5"/>
+        <rect x="136" y="32" width="208" height="56" rx="20" fill="rgba(45,49,66,0.03)" stroke="rgba(45,49,66,0.30)" stroke-width="1"/>
+        <text x="240" y="56" class="name" text-anchor="middle">그룹 새로고침</text>
+        <text x="240" y="72" class="subk" text-anchor="middle">대시보드 버튼</text>
+
+        <rect x="136" y="120" width="208" height="56" rx="6" fill="#f5f5f5"/>
+        <rect x="136" y="120" width="208" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+        <text x="240" y="144" class="name" text-anchor="middle">평균 벡터</text>
+        <text x="240" y="160" class="subk" text-anchor="middle">조각 평균, 길이 가중</text>
+
+        <polygon points="240,204 340,248 240,292 140,248" fill="#f5f5f5"/>
+        <polygon points="240,204 340,248 240,292 140,248" fill="rgba(191,69,32,0.08)" stroke="#bf4520" stroke-width="1"/>
+        <text x="240" y="246" class="name" text-anchor="middle">내용이 달라졌나?</text>
+        <text x="240" y="262" class="subk" text-anchor="middle">코사인 0.99 미만</text>
+
+        <rect x="456" y="220" width="208" height="56" rx="6" fill="#f5f5f5"/>
+        <rect x="456" y="220" width="208" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+        <text x="560" y="244" class="name" text-anchor="middle">메타데이터 재작성</text>
+        <text x="560" y="260" class="subk" text-anchor="middle">제목 · 태그 · 요약</text>
+        <rect x="464" y="226" width="28" height="12" rx="2" fill="none" stroke="rgba(45,49,66,0.40)" stroke-width="0.8"/>
+        <text x="478" y="235" class="tag" text-anchor="middle">LLM</text>
+
+        <rect x="456" y="336" width="208" height="56" rx="6" fill="#f5f5f5"/>
+        <rect x="456" y="336" width="208" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+        <text x="560" y="360" class="name" text-anchor="middle">태그 병합</text>
+        <text x="560" y="376" class="subk" text-anchor="middle">한 번 호출 · 카드 재생성</text>
+        <rect x="464" y="342" width="28" height="12" rx="2" fill="none" stroke="rgba(45,49,66,0.40)" stroke-width="0.8"/>
+        <text x="478" y="351" class="tag" text-anchor="middle">LLM</text>
+
+        <rect x="136" y="336" width="208" height="56" rx="6" fill="#f5f5f5"/>
+        <rect x="136" y="336" width="208" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+        <text x="240" y="360" class="name" text-anchor="middle">작은 군집</text>
+        <text x="240" y="376" class="sub" text-anchor="middle">average linkage · 0.28</text>
+
+        <polygon points="240,432 340,476 240,520 140,476" fill="#f5f5f5"/>
+        <polygon points="240,432 340,476 240,520 140,476" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+        <text x="240" y="474" class="name" text-anchor="middle">바뀐 게 있나?</text>
+        <text x="240" y="490" class="subk" text-anchor="middle">달라진 대화나 새 군집</text>
+
+        <rect x="456" y="452" width="208" height="48" rx="20" fill="#f5f5f5"/>
+        <rect x="456" y="452" width="208" height="48" rx="20" fill="rgba(45,49,66,0.03)" stroke="rgba(45,49,66,0.30)" stroke-width="1"/>
+        <text x="560" y="472" class="name" text-anchor="middle">완료</text>
+        <text x="560" y="488" class="subk" text-anchor="middle">LLM 호출 0번</text>
+
+        <rect x="136" y="560" width="208" height="56" rx="6" fill="#f5f5f5"/>
+        <rect x="136" y="560" width="208" height="56" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+        <text x="240" y="584" class="name" text-anchor="middle">분류 이름 짓기</text>
+        <text x="240" y="600" class="subk" text-anchor="middle">2번 호출 · gpt-5.4-mini</text>
+        <rect x="144" y="566" width="28" height="12" rx="2" fill="none" stroke="rgba(45,49,66,0.40)" stroke-width="0.8"/>
+        <text x="158" y="575" class="tag" text-anchor="middle">LLM</text>
+
+        <rect x="136" y="648" width="208" height="56" rx="20" fill="#f5f5f5"/>
+        <rect x="136" y="648" width="208" height="56" rx="20" fill="rgba(45,49,66,0.03)" stroke="rgba(45,49,66,0.30)" stroke-width="1"/>
+        <text x="240" y="672" class="name" text-anchor="middle">3D 지도, 저장</text>
+        <text x="240" y="688" class="sub" text-anchor="middle">PCA</text>
+
+        <text x="456" y="584" class="notek" text-anchor="start">달라진 대화 N개: LLM 호출 N + 3번</text>
+
+        <text x="456" y="604" class="notek" text-anchor="start">달라진 대화 없고 군집도 같으면 0번</text>
+
+        <line x1="32" y1="736" x2="728" y2="736" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+        <line x1="32" y1="760" x2="60" y2="760" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+        <text x="68" y="764" class="keyk" text-anchor="start">흐름</text>
+        <rect x="120" y="753" width="28" height="12" rx="2" fill="none" stroke="rgba(45,49,66,0.40)" stroke-width="0.8"/>
+        <text x="134" y="762" class="tag" text-anchor="middle">LLM</text>
+        <text x="156" y="764" class="keyk" text-anchor="start">LLM 호출</text>
+        <polygon points="248,752 256,760 248,768 240,760" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+        <text x="264" y="764" class="keyk" text-anchor="start">판단</text>
+        <rect x="316" y="753" width="24" height="14" rx="7" fill="rgba(45,49,66,0.03)" stroke="rgba(45,49,66,0.30)" stroke-width="1"/>
+        <text x="348" y="764" class="keyk" text-anchor="start">시작 / 끝</text>
+      </svg>
+    </div>
+  </div>
+</body>
+</html>

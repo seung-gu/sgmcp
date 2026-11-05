@@ -120,23 +120,23 @@ Two modes share one search box on the dashboard, and the apps get the same two a
 Every search and read made through MCP lands in `recall_log`, the way to check whether assistants follow a section through or stop at the first window.
 
 ## Refresh groups
-Apart from search passages, which every save indexes on its own, the dashboard button is the only derivation trigger. 🤖 marks an LLM call. With N drifted conversations a refresh makes **N + 3** calls (N metadata, one tag merge, two to name the tree); with no drift and the same clusters as last time it makes **none**.
+Apart from search passages, which every save indexes on its own, the dashboard button is the only derivation trigger. With N drifted conversations a refresh makes **N + 3** LLM calls; with no drift and the same clusters as last time it makes **none**.
 
-```mermaid
-flowchart TD
-    S([Refresh groups]) --> C["catch up search passages still behind<br/>(saves index their own; this repairs failed runs, ahead of the gate)"]
-    C --> E["mean vector = the passages' average, weighted by own length<br/>no embedding calls, skips conversations whose passages didn't move"]
-    E --> G{"drift check<br/>no anchor, or cosine below 0.99"}
-    G -- "one or more" --> M["🤖 regenerate drifted conversations only<br/>sample of 40 → title, tags (importance-ordered), summary<br/>anchor moves to the current vector, stale search card dropped"]
-    M --> T["🤖 tag merge, one global call<br/>unify same topic, different spellings<br/>retagged conversations drop their card too"]
-    T --> RC["rebuild every missing search card<br/>(now that title and tags are final)"]
-    RC --> K
-    G -- "none" --> K["small clusters (geometry, every refresh)<br/>passage mean + card, per-language centering<br/>average linkage, cosine 0.28"]
-    K --> CH{"anything drifted, or clusters<br/>differ from the stored ones?"}
-    CH -- "no" --> X(["done: groups, names, coordinates all kept<br/>zero LLM calls"])
-    CH -- "yes" --> N["🤖 name the whole tree, gpt-5.4-mini, two calls<br/>① invent about 5–15 big categories (a target, not checked), each with what it holds<br/>② place every group into one (closed choice) and name it<br/>failure stores nothing, so the next refresh retries"]
-    N --> P["3D coordinates (PCA) → store everything"]
-```
+![Refresh averages each conversation's passages, rewrites metadata only for conversations that drifted, re-clusters them, and calls an LLM to name the categories only when something changed](docs/diagrams/refresh-groups.png)
+
+Steps 4 to 6 run only when at least one conversation drifted.
+
+| Step | What happens | LLM calls |
+|---|---|---|
+| 1. Catch up | Index search passages still behind. Saves index their own; this repairs failed runs, before the drift check | 0 |
+| 2. Mean vectors | Each conversation's vector is its passages' average, weighted by their own length. No embedding calls; conversations whose passages didn't move are skipped | 0 |
+| 3. Drift check | A conversation drifted when it has no anchor yet, or its vector's cosine to the anchor is below 0.99 | 0 |
+| 4. Rewrite metadata | For drifted conversations only, a sample of 40 messages gives a new title, tags (importance-ordered) and summary. The anchor moves to the current vector, and the stale search card is dropped | 1 per drifted conversation |
+| 5. Merge tags | One call over all tags unifies different spellings of the same topic. Retagged conversations drop their card too | 1 |
+| 6. Rebuild cards | Every missing search card is rebuilt, now that titles and tags are final | 0 (embeddings only) |
+| 7. Small clusters | Geometry, on every refresh: passage mean + card, per-language centering, average linkage at cosine 0.28 | 0 |
+| 8. Name the tree | Only when something drifted or the clusters differ from the stored ones. `gpt-5.4-mini` invents about 5 to 15 big categories, each with what it holds (a target, not checked), then places every group into one (a closed choice) and names it. A failure stores nothing, so the next refresh retries | 2 |
+| 9. 3D map | Coordinates by PCA, then everything is stored | 0 |
 
 The sample: split the conversation into 20 segments and take the longest user and assistant message from each, at most 40 messages of 400 characters each.
 
