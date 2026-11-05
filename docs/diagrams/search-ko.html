@@ -54,7 +54,7 @@
     <h1>검색이 맞는 구간을 찾는 과정</h1>
 
     <div class="diagram-container">
-      <svg viewBox="0 0 936 504" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="search-ko-title search-ko-desc">
+      <svg viewBox="0 0 936 440" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="search-ko-title search-ko-desc">
         <title id="search-ko-title">의미 검색</title>
         <desc id="search-ko-desc">저장할 때마다 대화를 조각으로 자르고 새 조각만 임베딩. 질문은 임베딩 후 대화마다 가장 가까운 조각과 비교하고, 구간으로 묶어 그 구간만 읽기.</desc>
         <defs>
@@ -159,19 +159,15 @@
 
         <text x="496" y="116" class="notek" text-anchor="start">새 조각만 임베딩</text>
 
-        <text x="264" y="388" class="notek" text-anchor="start">가장 가까운 조각 기준 순위: 첫 결과 정답률 68%.</text>
-
-        <text x="264" y="408" class="notek" text-anchor="start">대화마다 평균 벡터 하나로 비교할 때는 48%.</text>
-
-        <line x1="32" y1="444" x2="904" y2="444" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
-        <line x1="32" y1="468" x2="60" y2="468" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
-        <text x="68" y="472" class="keyk" text-anchor="start">단계</text>
-        <line x1="120" y1="468" x2="148" y2="468" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#arrow-link)"/>
-        <text x="156" y="472" class="keyk" text-anchor="start">OpenAI 임베딩</text>
-        <rect x="272" y="462" width="14" height="12" rx="2" fill="rgba(79,93,117,0.10)" stroke="#5a6580" stroke-width="1"/>
-        <text x="294" y="472" class="keyk" text-anchor="start">입력</text>
-        <rect x="346" y="462" width="14" height="12" rx="2" fill="rgba(45,49,66,0.05)" stroke="#4f5d75" stroke-width="1"/>
-        <text x="368" y="472" class="keyk" text-anchor="start">데이터베이스</text>
+        <line x1="32" y1="384" x2="904" y2="384" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+        <line x1="32" y1="408" x2="60" y2="408" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+        <text x="68" y="412" class="keyk" text-anchor="start">단계</text>
+        <line x1="120" y1="408" x2="148" y2="408" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#arrow-link)"/>
+        <text x="156" y="412" class="keyk" text-anchor="start">OpenAI 임베딩</text>
+        <rect x="272" y="402" width="14" height="12" rx="2" fill="rgba(79,93,117,0.10)" stroke="#5a6580" stroke-width="1"/>
+        <text x="294" y="412" class="keyk" text-anchor="start">입력</text>
+        <rect x="346" y="402" width="14" height="12" rx="2" fill="rgba(45,49,66,0.05)" stroke="#4f5d75" stroke-width="1"/>
+        <text x="368" y="412" class="keyk" text-anchor="start">데이터베이스</text>
       </svg>
     </div>
   </div>

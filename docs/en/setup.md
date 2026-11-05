@@ -33,7 +33,7 @@ The schema is created and updated on the first database connection. Statements t
 | `INGEST_TOKEN` | Auth token for `POST /api/ingest`, used by the Claude Code hook |
 | `OPENAI_API_KEY` | Embeddings, meaning search and metadata generation. List and keyword search work without it |
 | `ARCHIVE_LANGUAGE` | Language of all derived text: titles, tags, summaries, group names (default: Korean) |
-| `EVAL_DATABASE_URL` | Connection string of the eval branch (see [Evaluating search](eval.md)). Only the eval and its pre-push hook use it |
+| `EVAL_DATABASE_URL` | Connection string of the eval branch (see [Evaluating search and grouping](eval.md)). Only the eval and its pre-push hook use it |
 
 ## Connect an app
 Leave the trailing slash off the endpoint URL: `/mcp/` answers with a 307 redirect and the connection fails.

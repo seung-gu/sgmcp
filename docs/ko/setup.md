@@ -33,7 +33,7 @@ curl -X POST http://localhost:8000/mcp \
 | `INGEST_TOKEN` | `POST /api/ingest` 인증 토큰. Claude Code hook이 사용 |
 | `OPENAI_API_KEY` | 임베딩, 의미 검색, 제목·태그·요약 생성. 목록과 키워드 검색은 없어도 동작 |
 | `ARCHIVE_LANGUAGE` | 제목, 태그, 요약, 그룹 이름 등 파생 글의 언어(기본값: 한국어) |
-| `EVAL_DATABASE_URL` | eval branch 접속 문자열([검색 평가](eval.md) 참고). eval과 pre-push hook만 사용 |
+| `EVAL_DATABASE_URL` | eval branch 접속 문자열([검색·그룹 평가](eval.md) 참고). eval과 pre-push hook만 사용 |
 
 ## 앱 연결
 주소 끝에 `/` 금지. `/mcp/`는 307 리다이렉트를 돌려줘서 연결 실패.

@@ -24,6 +24,15 @@ sgmcp is a personal MCP server that gives your AI apps one shared memory. It sav
 
 ![Claude and ChatGPT apps, the Claude Code hook and a browser call the sgmcp server on Fly.io, which stores everything in Neon Postgres and calls OpenAI and WorkOS](docs/diagrams/architecture.png)
 
+## Dashboard
+![The sgmcp dashboard: topic groups, the 3D map of conversations and the conversation list, with personal text blurred](docs/dashboard.png)
+
+`/dashboard`, after a WorkOS sign-in:
+
+- Topic groups under big categories, named by an LLM, and a 3D map of every conversation
+- Keyword and meaning search, the conversation list, and a reading view with the link or resume command back to the source
+- The Refresh groups button writes new titles, tags and summaries only for conversations whose content has moved on. When nothing has changed, it makes no LLM calls
+
 ## Features
 | Feature | What it does |
 |---|---|
@@ -52,14 +61,7 @@ The lines to paste and the hook setup: [Setup § Auto-save](docs/en/setup.md#aut
 - Meaning search finds a topic when you no longer remember the words, in any language. Each conversation is cut into 1,500-character passages, and it ranks by its best passage.
 - Each result lists sections: where in the conversation the match sits, and when it was said. `get_conversation(start=…)` reads from there, a page of about 20,000 characters at a time.
 
-## Dashboard
-![The sgmcp dashboard: topic groups, the 3D map of conversations and the conversation list, with personal text blurred](docs/dashboard.png)
-
-`/dashboard`, after a WorkOS sign-in:
-
-- Topic groups under big categories, named by an LLM, and a 3D map of every conversation
-- Keyword and meaning search, the conversation list, and a reading view with the link or resume command back to the source
-- The Refresh groups button writes new titles, tags and summaries only for conversations whose content has moved on. When nothing has changed, it makes no LLM calls
+Why passages, and how search is scored: [Evaluating search and grouping](docs/en/eval.md).
 
 ## MCP tools
 | Tool | Does |
@@ -99,14 +101,8 @@ Environment variables, connecting each app, the Claude Code hook and deploying: 
 |---|---|
 | [Setup](docs/en/setup.md) | running locally, environment variables, connecting apps, auto-save, the Claude Code hook, deploying |
 | [MCP tools](docs/en/tools.md) | every tool, its arguments, sections and paging |
-| [Evaluating search](docs/en/eval.md) | the eval branch, the two evals, baselines, the pre-push hook |
-| [ARCHITECTURE.md](ARCHITECTURE.md) | save flows, the refresh pipeline, search internals, data model, measured values |
-
-## What I learned
-- **Keep the verbatim text as the only truth.** I reset and recomputed every derived column several times during development and lost nothing, because the raw messages were never touched.
-- **Geometry answers "are these similar?"; an LLM answers "what kind of thing is this?"** Grouping the big categories by geometry alone left 7 near-singleton groups.
-- **Search passages, not averages.** On 66 queries with known answers, the right conversation came first 68% of the time with passages, 59% with single messages and 48% with one average vector per conversation.
-- **Weight by length.** With an equal-weighted mean, short meta remarks made up 37% of the characters but cast 53% of the vote, and misplaced a conversation.
+| [Evaluating search and grouping](docs/en/eval.md) | how search and grouping are scored, current results, and the measurements behind passages, length weighting and LLM-named categories |
+| [Architecture](ARCHITECTURE.md) | the whole flow in one picture, then each part: saving, storage, search index, search, Refresh groups, sign-in |
 
 ## Future ideas
 - [ ] Split conversations that mix two topics, so each part lands in its own group
