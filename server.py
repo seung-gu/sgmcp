@@ -1,7 +1,9 @@
 # sgmcp — personal conversation-archive MCP server
 
+import json
 import logging
 import os
+import re
 import uuid
 from typing import Annotated
 
@@ -32,7 +34,11 @@ PAGE_CHARS = 20_000
 
 class Message(BaseModel):
     role: str = Field(description="speaker: user or assistant")
-    content: str = Field(description="message content, verbatim")
+    content: str = Field(
+        description="message content, verbatim. Write every character as itself, never "
+        "as a \\uXXXX escape: Korean stays Korean (삐끗했어요), not \\uc090\\ub057...",
+        examples=["어제 라우팅이 삐끗했어요", "어느 단계에서 그랬나요?"],
+    )
 
 
 @mcp.tool()
@@ -251,10 +257,59 @@ def _log_recall(tool: str, args: dict, result: dict) -> None:
         logging.getLogger(__name__).exception("recall_log write failed")
 
 
+# Diagnostic (2026-11-12): how do clients write non-ASCII text in tool calls? A model
+# that types \uXXXX escapes writes six characters per Korean one, and one wrong hex
+# digit corrupts the saved text. Logs counts only, never content. Drop it once settled.
+# `(?<!\\)(?:\\\\)*` skips an escaped backslash, so the text "ሴ" is not counted.
+_ESCAPE = re.compile(rb"(?<!\\)(?:\\\\)*\\u([0-9a-fA-F]{4})")
+
+
+def _log_escapes(body: bytes) -> None:
+    try:
+        request = json.loads(body)
+    except ValueError:
+        return
+    if not isinstance(request, dict) or request.get("method") != "tools/call":
+        return
+    escaped = sum(int(m.group(1), 16) >= 0x80 for m in _ESCAPE.finditer(body))
+    raw = sum(ch >= "\x80" for ch in body.decode("utf-8", "replace"))
+    tool = (request.get("params") or {}).get("name")
+    logging.getLogger(__name__).info("tools/call %s: escaped=%d raw=%d", tool, escaped, raw)
+
+
+def _count_escapes(app):
+    """ASGI wrapper: read each POST /mcp body for _log_escapes, then pass it on unchanged."""
+
+    async def wrapped(scope, receive, send):
+        if scope["type"] != "http" or scope["method"] != "POST" or scope["path"] != "/mcp":
+            await app(scope, receive, send)
+            return
+        messages = [await receive()]
+        while messages[-1].get("more_body"):
+            messages.append(await receive())
+        _log_escapes(b"".join(m.get("body", b"") for m in messages))
+        pending = iter(messages)
+
+        async def replay():
+            return next(pending, None) or await receive()
+
+        await app(scope, replay, send)
+
+    return wrapped
+
+
 dashboard.register(mcp)
 ingest.register(mcp)
 
 
 if __name__ == "__main__":
-    # remote deployment over HTTP — endpoint is /mcp
-    mcp.run(transport="streamable-http")
+    import uvicorn
+
+    # remote deployment over HTTP — endpoint is /mcp. What mcp.run("streamable-http")
+    # does, with the escape counter around the app
+    uvicorn.run(
+        _count_escapes(mcp.streamable_http_app()),
+        host=mcp.settings.host,
+        port=mcp.settings.port,
+        log_level=mcp.settings.log_level.lower(),
+    )
