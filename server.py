@@ -69,12 +69,26 @@ def save_conversation(
     return result
 
 
+_AppendKey = Annotated[
+    str,
+    Field(description="key of the conversation to append to (issued by save_conversation)"),
+]
+_Project = Annotated[
+    str, Field(description="project this conversation belongs to (omit to keep current)")
+]
+_SourceUrl = Annotated[
+    str,
+    Field(
+        description="URL of this conversation, if the user provides one (e.g. the "
+        "claude.ai/chat/... address). Enables reopening it from the dashboard. "
+        "Omit to keep current; only send a user-supplied URL, never invent one"
+    ),
+]
+
+
 @mcp.tool()
 def append_messages(
-    conversation_key: Annotated[
-        str,
-        Field(description="key of the conversation to append to (issued by save_conversation)"),
-    ],
+    conversation_key: _AppendKey,
     new_messages: Annotated[
         list[str],
         Field(
@@ -85,17 +99,8 @@ def append_messages(
             min_length=1,
         ),
     ],
-    project: Annotated[
-        str, Field(description="project this conversation belongs to (omit to keep current)")
-    ] = "",
-    source_url: Annotated[
-        str,
-        Field(
-            description="URL of this conversation, if the user provides one (e.g. the "
-            "claude.ai/chat/... address). Enables reopening it from the dashboard. "
-            "Omit to keep current; only send a user-supplied URL, never invent one"
-        ),
-    ] = "",
+    project: _Project = "",
+    source_url: _SourceUrl = "",
 ) -> dict:
     """Appends the messages not saved yet to an existing conversation. Use this for
     per-turn saving. Messages that repeat the end of what is already saved (a retry, or
@@ -103,10 +108,10 @@ def append_messages(
 
     If the response contains "ask_for_url": true, ask the user once to paste this
     conversation's URL from their address bar, then pass it as source_url next time."""
-    # Strings, not {role, content} objects: claude.ai wrote Korean inside a list of
-    # objects as \uXXXX escapes (six characters for one, and a wrong hex digit changed
-    # the saved text), but top-level strings as they are. Trying whether a list of
-    # plain strings is enough (2026-11-12)
+    # claude.ai wrote Korean inside a list as \uXXXX escapes (six characters for one,
+    # and a wrong hex digit changed the saved text), first in {role, content} objects and
+    # then in plain strings too. Top-level strings came as they are (2026-11-12): see
+    # append_turn
     messages = []
     for i, item in enumerate(new_messages):
         role, sep, content = item.partition(":")
@@ -114,6 +119,38 @@ def append_messages(
         if not sep or role not in ("user", "assistant"):
             raise ValueError(f"new_messages[{i}] must start with 'user: ' or 'assistant: '")
         messages.append({"role": role, "content": content.removeprefix(" ")})
+    return _append(conversation_key, messages, project, source_url)
+
+
+@mcp.tool()
+def append_turn(
+    conversation_key: _AppendKey,
+    user_message: Annotated[
+        str, Field(description="the user's message of the turn, verbatim", min_length=1)
+    ],
+    assistant_message: Annotated[
+        str,
+        Field(
+            description="your answer in that turn, verbatim. Leave empty when the user sent "
+            "two messages in a row: save the first alone, then the second with your answer"
+        ),
+    ] = "",
+    project: _Project = "",
+    source_url: _SourceUrl = "",
+) -> dict:
+    """Appends one turn to an existing conversation: the user's message and your answer
+    as two plain strings. A turn that repeats the end of what is already saved (a retry)
+    is stored only once (duplicate guard).
+
+    If the response contains "ask_for_url": true, ask the user once to paste this
+    conversation's URL from their address bar, then pass it as source_url next time."""
+    messages = [{"role": "user", "content": user_message}]
+    if assistant_message:
+        messages.append({"role": "assistant", "content": assistant_message})
+    return _append(conversation_key, messages, project, source_url)
+
+
+def _append(conversation_key: str, messages: list[dict], project: str, source_url: str) -> dict:
     result = db.append_messages(conversation_key, messages, project, source_url)
     if result is None:
         raise ValueError(
