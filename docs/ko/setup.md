@@ -59,8 +59,8 @@ curl -X POST http://localhost:8000/mcp \
 ```text
 sgmcp 커넥터를 쓸 수 있으면:
 - 대화의 첫 답변 뒤 save_conversation으로 저장하고, 돌려받은 conversation_key를 기억할 것.
-- 이후 답변할 때마다 그 키로 append_messages를 호출해 아직 저장하지 않은 메시지를
-  원문 그대로 추가할 것.
+- 이후 답변할 때마다 그 키로 append_message를 호출해 내 메시지와 답을 원문 그대로
+  추가할 것. 저장을 건너뛴 턴은 오래된 턴부터 한 턴씩 호출할 것.
 - 내가 예전 작업을 언급하면 먼저 sgmcp를 검색하고(search_conversations_by_meaning,
   정확한 이름은 search_conversations), 맞는 구간을 get_conversation으로 읽을 것.
 ```

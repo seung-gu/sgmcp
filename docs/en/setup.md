@@ -60,8 +60,8 @@ An example to adapt:
 When the sgmcp connector is available:
 - After your first answer in a conversation, save it with save_conversation and keep
   the conversation_key it returns.
-- After every later answer, call append_messages with that key and the messages not
-  saved yet, verbatim.
+- After every later answer, call append_message with that key, my message and your
+  answer, verbatim. For turns whose save was skipped, one call per turn, oldest first.
 - When I refer to earlier work, search sgmcp first (search_conversations_by_meaning,
   or search_conversations for exact names) and read the matching section with
   get_conversation.

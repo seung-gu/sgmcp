@@ -43,12 +43,12 @@ sequenceDiagram
     participant DB as Neon
 
     Note over F: 대화 시작, 첫 답변 완료
-    F->>S: save_conversation (빈 키, 첫 턴 원문)
+    F->>S: save_conversation (첫 턴 원문)
     S->>DB: INSERT, 서버가 키 발급 (cw-UUID)
     S-->>F: conversation_key 반환
 
     loop 답변할 때마다
-        F->>S: append_messages (그 키, 아직 저장 안 한 턴 원문)
+        F->>S: append_message (그 키, 그 턴 원문)
         S->>DB: 추가 (이미 저장된 메시지는 한 번만 보관)
         S-)S: 새 검색 조각 색인 (백그라운드)
     end

@@ -43,12 +43,12 @@ sequenceDiagram
     participant DB as Neon
 
     Note over F: conversation starts, first answer done
-    F->>S: save_conversation (empty key, first turn verbatim)
+    F->>S: save_conversation (first turn verbatim)
     S->>DB: INSERT, the server issues the key (cw-UUID)
     S-->>F: returns conversation_key
 
     loop after every answer
-        F->>S: append_messages (that key, unsaved turns verbatim)
+        F->>S: append_message (that key, the turn verbatim)
         S->>DB: append (messages already saved are stored once)
         S-)S: index new search passages (background)
     end

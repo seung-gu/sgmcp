@@ -48,7 +48,7 @@ sgmcp is a personal MCP server that gives your AI apps one shared memory. It sav
 
 | App | Saves | Recalls |
 |---|---|---|
-| claude.ai | `save_conversation` once, then `append_messages` after every answer, asked for by a few lines in its personal preferences | `search_conversations_by_meaning`, `search_conversations`, `get_conversation` |
+| claude.ai | `save_conversation` once, then `append_message` after every answer, asked for by a few lines in its personal preferences | `search_conversations_by_meaning`, `search_conversations`, `get_conversation` |
 | ChatGPT | the same tools through the sgmcp connector, asked for by the same lines in its instructions | the same tools |
 | Claude Code | a global Stop hook posts the session transcript to `/api/ingest`: no model tokens, the text exactly as written | the same tools, after `claude mcp add` |
 
@@ -67,6 +67,7 @@ Why passages, and how search is scored: [Evaluating search and grouping](docs/en
 | Tool | Does |
 |---|---|
 | `save_conversation` | creates a conversation; the server issues its key |
+| `append_message` | adds one turn, as two plain strings |
 | `append_messages` | adds the turns not saved yet |
 | `get_conversation` | the summary first, then the verbatim messages a page at a time |
 | `list_conversations` | recent conversations, without message bodies |

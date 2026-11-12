@@ -39,32 +39,43 @@ class Message(BaseModel):
     )
 
 
+# One turn as two top-level strings, never inside a list: claude.ai writes Korean inside
+# a list as \uXXXX escapes, and a wrong hex digit changes the saved text (2026-11-12)
+_UserMessage = Annotated[
+    str, Field(description="the user's message of the turn, verbatim", min_length=1)
+]
+_AssistantMessage = Annotated[
+    str,
+    Field(
+        description="your answer in that turn, verbatim. Leave empty when the user sent "
+        "two messages in a row: save the first alone, then the second with your answer"
+    ),
+]
+
+
+def _turn(user_message: str, assistant_message: str) -> list[dict]:
+    messages = [{"role": "user", "content": user_message}]
+    if assistant_message:
+        messages.append({"role": "assistant", "content": assistant_message})
+    return messages
+
+
 @mcp.tool()
 def save_conversation(
-    messages: Annotated[
-        list[Message], Field(description="the conversation so far, in order, verbatim")
-    ],
+    user_message: _UserMessage,
+    assistant_message: _AssistantMessage = "",
     source: Annotated[
         str, Field(description="client the conversation happened in, e.g. claude.ai, claude-code, chatgpt")
     ] = "",
     project: Annotated[str, Field(description="project this conversation belongs to, if any")] = "",
-    conversation_key: Annotated[
-        str,
-        Field(
-            description="Leave empty — the server issues a key and returns it. Only pass a key "
-            "when overwriting an existing conversation (repair). Never invent keys."
-        ),
-    ] = "",
 ) -> dict:
-    """Creates a conversation (call once when a meaningful conversation starts), or
-    overwrites an existing one wholesale (repair). Use the conversation_key from the
-    response for all later append_messages calls. Title, tags and summary are
-    generated server-side — do not send them."""
-    key = conversation_key or f"cw-{uuid.uuid4()}"
-    # a key means an explicit repair, which may change any message: rewrite them all
-    result = db.save_conversation(
-        key, [m.model_dump() for m in messages], source, project, replace=bool(conversation_key)
-    )
+    """Creates a conversation with its first turn: call once when a meaningful
+    conversation starts. The server issues the key; use the conversation_key from the
+    response for all later append_message calls. Saving starts partway through: save
+    the earliest turn not saved yet here, then append the rest with append_message.
+    Title, tags and summary are generated server-side — do not send them."""
+    key = f"cw-{uuid.uuid4()}"
+    result = db.save_conversation(key, _turn(user_message, assistant_message), source, project)
     grouping.index_soon(key)
     return result
 
@@ -90,12 +101,10 @@ _SourceUrl = Annotated[
 def append_messages(
     conversation_key: _AppendKey,
     new_messages: Annotated[
-        list[str],
+        list[Message],
         Field(
             description="the messages not saved yet, in order: normally the latest turn, "
-            "plus any earlier turn whose save was skipped. One string per message: "
-            "'user: ' or 'assistant: ', then the message verbatim",
-            examples=[["user: 어제 라우팅이 삐끗했어요", "assistant: 어느 단계에서 그랬나요?"]],
+            "plus any earlier turn whose save was skipped",
             min_length=1,
         ),
     ],
@@ -108,46 +117,26 @@ def append_messages(
 
     If the response contains "ask_for_url": true, ask the user once to paste this
     conversation's URL from their address bar, then pass it as source_url next time."""
-    # claude.ai wrote Korean inside a list as \uXXXX escapes (six characters for one,
-    # and a wrong hex digit changed the saved text), first in {role, content} objects and
-    # then in plain strings too. Top-level strings came as they are (2026-11-12): see
-    # append_turn
-    messages = []
-    for i, item in enumerate(new_messages):
-        role, sep, content = item.partition(":")
-        role = role.strip().lower()
-        if not sep or role not in ("user", "assistant"):
-            raise ValueError(f"new_messages[{i}] must start with 'user: ' or 'assistant: '")
-        messages.append({"role": role, "content": content.removeprefix(" ")})
-    return _append(conversation_key, messages, project, source_url)
+    # claude.ai writes Korean inside this list as \uXXXX escapes: see _UserMessage
+    return _append(conversation_key, [m.model_dump() for m in new_messages], project, source_url)
 
 
 @mcp.tool()
-def append_turn(
+def append_message(
     conversation_key: _AppendKey,
-    user_message: Annotated[
-        str, Field(description="the user's message of the turn, verbatim", min_length=1)
-    ],
-    assistant_message: Annotated[
-        str,
-        Field(
-            description="your answer in that turn, verbatim. Leave empty when the user sent "
-            "two messages in a row: save the first alone, then the second with your answer"
-        ),
-    ] = "",
+    user_message: _UserMessage,
+    assistant_message: _AssistantMessage = "",
     project: _Project = "",
     source_url: _SourceUrl = "",
 ) -> dict:
     """Appends one turn to an existing conversation: the user's message and your answer
-    as two plain strings. A turn that repeats the end of what is already saved (a retry)
-    is stored only once (duplicate guard).
+    as two plain strings. Use this for per-turn saving. Several turns behind: call once
+    per turn, oldest first, one call at a time. A turn that repeats the end of what is
+    already saved (a retry) is stored only once (duplicate guard).
 
     If the response contains "ask_for_url": true, ask the user once to paste this
     conversation's URL from their address bar, then pass it as source_url next time."""
-    messages = [{"role": "user", "content": user_message}]
-    if assistant_message:
-        messages.append({"role": "assistant", "content": assistant_message})
-    return _append(conversation_key, messages, project, source_url)
+    return _append(conversation_key, _turn(user_message, assistant_message), project, source_url)
 
 
 def _append(conversation_key: str, messages: list[dict], project: str, source_url: str) -> dict:
@@ -155,7 +144,7 @@ def _append(conversation_key: str, messages: list[dict], project: str, source_ur
     if result is None:
         raise ValueError(
             f"'{conversation_key}' does not exist. If this is a new conversation, call "
-            "save_conversation with an empty key. If you were continuing an existing one, "
+            "save_conversation. If you were continuing an existing one, "
             "call list_conversations to find the most recent conversation and use its "
             "conversation_key. Never invent keys."
         )

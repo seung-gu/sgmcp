@@ -48,7 +48,7 @@ WorkOS 로그인 후 `/dashboard`:
 
 | 앱 | 저장 | 불러오기 |
 |---|---|---|
-| claude.ai | 처음 한 번 `save_conversation`, 이후 답변마다 `append_messages`. 개인 설정(personal preferences)에 넣은 몇 줄로 요청 | `search_conversations_by_meaning`, `search_conversations`, `get_conversation` |
+| claude.ai | 처음 한 번 `save_conversation`, 이후 답변마다 `append_message`. 개인 설정(personal preferences)에 넣은 몇 줄로 요청 | `search_conversations_by_meaning`, `search_conversations`, `get_conversation` |
 | ChatGPT | sgmcp 커넥터로 같은 도구 사용. 지침에 넣은 같은 몇 줄로 요청 | 같은 도구 |
 | Claude Code | 전역 Stop hook이 세션 기록을 `/api/ingest`로 전송. 모델 토큰 사용 없음, 원문 그대로 저장 | `claude mcp add` 후 같은 도구 |
 
@@ -67,6 +67,7 @@ WorkOS 로그인 후 `/dashboard`:
 | 도구 | 기능 |
 |---|---|
 | `save_conversation` | 대화 생성. 키는 서버가 발급 |
+| `append_message` | 턴 하나를 문자열 두 개로 추가 |
 | `append_messages` | 아직 저장하지 않은 턴 추가 |
 | `get_conversation` | 요약 먼저, 이후 원문 메시지를 한 페이지씩 |
 | `list_conversations` | 최근 대화 목록. 메시지 본문 제외 |
