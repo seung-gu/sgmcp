@@ -7,7 +7,7 @@ Endpoint `https://<your-app>.fly.dev/mcp`, streamable HTTP, WorkOS sign-in when 
 | Tool | What it does |
 |---|---|
 | `save_conversation(messages, source?, project?, key?)` | Create a conversation (the server issues a `cw-`+UUID key when none is given), or overwrite one to repair it |
-| `append_messages(key, new_messages, project?, source_url?)` | Append the messages not saved yet: the latest turn, plus any turn whose save was skipped. Messages already saved are stored once. `source_url` stores the chat's address for reopening |
+| `append_messages(key, new_messages, project?, source_url?)` | Append the messages not saved yet: the latest turn, plus any turn whose save was skipped. One string per message, starting with `user: ` or `assistant: `. Messages already saved are stored once. `source_url` stores the chat's address for reopening |
 | `get_conversation(key, full=False, start?, count?)` | Load one conversation, summary first. `full=true`, `start` or `count` adds the verbatim messages one page (about 20,000 characters) at a time: from `start`, or the most recent when omitted, so a short conversation comes back whole. `count` caps the number of messages; `next_start`/`prev_start` keep reading. Each message carries its time (`at`) |
 | `list_conversations(limit)` | Recent conversations, without message bodies |
 | `search_conversations(query, limit)` | Keyword search over title, summary and content; each result lists where the keyword occurs (`sections`, newest first) |

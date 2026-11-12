@@ -7,7 +7,7 @@
 | 도구 | 기능 |
 |---|---|
 | `save_conversation(messages, source?, project?, key?)` | 대화 생성(키를 주지 않으면 서버가 `cw-`+UUID 키 발급). 키를 주면 기존 대화를 통째로 덮어써 복구 |
-| `append_messages(key, new_messages, project?, source_url?)` | 아직 저장하지 않은 메시지 추가: 마지막 턴, 그리고 저장을 건너뛴 이전 턴. 이미 저장된 메시지는 한 번만 보관. `source_url`은 다시 열 채팅 주소 |
+| `append_messages(key, new_messages, project?, source_url?)` | 아직 저장하지 않은 메시지 추가: 마지막 턴, 그리고 저장을 건너뛴 이전 턴. 메시지 하나는 `user: `나 `assistant: `로 시작하는 문자열 하나. 이미 저장된 메시지는 한 번만 보관. `source_url`은 다시 열 채팅 주소 |
 | `get_conversation(key, full=False, start?, count?)` | 대화 하나 불러오기. 요약 먼저. `full=true`, `start`, `count`를 주면 원문 메시지를 한 페이지(약 20,000자)씩 추가: `start`부터, 없으면 가장 최근 메시지부터. 짧은 대화는 한 번에 전체. `count`는 메시지 수 상한, `next_start`/`prev_start`로 이어 읽기. 메시지마다 보낸 시각(`at`) 포함 |
 | `list_conversations(limit)` | 최근 대화 목록. 메시지 본문 제외 |
 | `search_conversations(query, limit)` | 제목, 요약, 본문 키워드 검색. 결과마다 키워드가 나온 위치(`sections`, 최신순) 포함 |

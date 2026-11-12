@@ -1,9 +1,7 @@
 # sgmcp — personal conversation-archive MCP server
 
-import json
 import logging
 import os
-import re
 import uuid
 from typing import Annotated
 
@@ -78,10 +76,12 @@ def append_messages(
         Field(description="key of the conversation to append to (issued by save_conversation)"),
     ],
     new_messages: Annotated[
-        list[Message],
+        list[str],
         Field(
             description="the messages not saved yet, in order: normally the latest turn, "
-            "plus any earlier turn whose save was skipped",
+            "plus any earlier turn whose save was skipped. One string per message: "
+            "'user: ' or 'assistant: ', then the message verbatim",
+            examples=[["user: 어제 라우팅이 삐끗했어요", "assistant: 어느 단계에서 그랬나요?"]],
             min_length=1,
         ),
     ],
@@ -103,9 +103,18 @@ def append_messages(
 
     If the response contains "ask_for_url": true, ask the user once to paste this
     conversation's URL from their address bar, then pass it as source_url next time."""
-    result = db.append_messages(
-        conversation_key, [m.model_dump() for m in new_messages], project, source_url
-    )
+    # Strings, not {role, content} objects: claude.ai wrote Korean inside a list of
+    # objects as \uXXXX escapes (six characters for one, and a wrong hex digit changed
+    # the saved text), but top-level strings as they are. Trying whether a list of
+    # plain strings is enough (2026-11-12)
+    messages = []
+    for i, item in enumerate(new_messages):
+        role, sep, content = item.partition(":")
+        role = role.strip().lower()
+        if not sep or role not in ("user", "assistant"):
+            raise ValueError(f"new_messages[{i}] must start with 'user: ' or 'assistant: '")
+        messages.append({"role": role, "content": content.removeprefix(" ")})
+    result = db.append_messages(conversation_key, messages, project, source_url)
     if result is None:
         raise ValueError(
             f"'{conversation_key}' does not exist. If this is a new conversation, call "
@@ -257,59 +266,10 @@ def _log_recall(tool: str, args: dict, result: dict) -> None:
         logging.getLogger(__name__).exception("recall_log write failed")
 
 
-# Diagnostic (2026-11-12): how do clients write non-ASCII text in tool calls? A model
-# that types \uXXXX escapes writes six characters per Korean one, and one wrong hex
-# digit corrupts the saved text. Logs counts only, never content. Drop it once settled.
-# `(?<!\\)(?:\\\\)*` skips an escaped backslash, so the text "ሴ" is not counted.
-_ESCAPE = re.compile(rb"(?<!\\)(?:\\\\)*\\u([0-9a-fA-F]{4})")
-
-
-def _log_escapes(body: bytes) -> None:
-    try:
-        request = json.loads(body)
-    except ValueError:
-        return
-    if not isinstance(request, dict) or request.get("method") != "tools/call":
-        return
-    escaped = sum(int(m.group(1), 16) >= 0x80 for m in _ESCAPE.finditer(body))
-    raw = sum(ch >= "\x80" for ch in body.decode("utf-8", "replace"))
-    tool = (request.get("params") or {}).get("name")
-    logging.getLogger(__name__).info("tools/call %s: escaped=%d raw=%d", tool, escaped, raw)
-
-
-def _count_escapes(app):
-    """ASGI wrapper: read each POST /mcp body for _log_escapes, then pass it on unchanged."""
-
-    async def wrapped(scope, receive, send):
-        if scope["type"] != "http" or scope["method"] != "POST" or scope["path"] != "/mcp":
-            await app(scope, receive, send)
-            return
-        messages = [await receive()]
-        while messages[-1].get("more_body"):
-            messages.append(await receive())
-        _log_escapes(b"".join(m.get("body", b"") for m in messages))
-        pending = iter(messages)
-
-        async def replay():
-            return next(pending, None) or await receive()
-
-        await app(scope, replay, send)
-
-    return wrapped
-
-
 dashboard.register(mcp)
 ingest.register(mcp)
 
 
 if __name__ == "__main__":
-    import uvicorn
-
-    # remote deployment over HTTP — endpoint is /mcp. What mcp.run("streamable-http")
-    # does, with the escape counter around the app
-    uvicorn.run(
-        _count_escapes(mcp.streamable_http_app()),
-        host=mcp.settings.host,
-        port=mcp.settings.port,
-        log_level=mcp.settings.log_level.lower(),
-    )
+    # remote deployment over HTTP — endpoint is /mcp
+    mcp.run(transport="streamable-http")
